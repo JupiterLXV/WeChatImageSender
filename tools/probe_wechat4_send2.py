@@ -69,7 +69,8 @@ def main():
                 result = image_state(frame, source, dpi, binding['version'])
                 entry['visual_before'] = result.state.value
                 if result.matched:
-                    entry['menu'] = read_image_menu(backend, binding, row, source, dpi)
+                    entry['menu'] = read_image_menu(backend, binding, row, result.thumbnail_bounds, dpi,
+                                                    (r.left, r.top, r.right, r.bottom))
                     after = backend.observe(token, binding)
                     entry['state_after'] = after.state.value
             history.append(entry)

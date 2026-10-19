@@ -48,7 +48,17 @@ def _menus(pid):
     return found
 
 
-def read_image_menu(backend, binding, row, source, dpi):
+def image_menu_point(row_rect, thumbnail_bounds):
+    if thumbnail_bounds is None:
+        raise NeedsReview('尚未匹配本条图片，不能检查菜单。')
+    x0, y0, x1, y1 = row_rect
+    left, top, right, bottom = thumbnail_bounds
+    if not (0 <= left < right <= x1 - x0 and 0 <= top < bottom <= y1 - y0):
+        raise NeedsReview('图片菜单定位超出当前消息范围。')
+    return x0 + (left + right) / 2, y0 + (top + bottom) / 2
+
+
+def read_image_menu(backend, binding, row, thumbnail_bounds, dpi, observed_rect):
     from .wechat import rid
     backend.assert_target(binding)
     if backend.stop is not None and backend.stop.is_set():
@@ -57,14 +67,11 @@ def read_image_menu(backend, binding, row, source, dpi):
         raise NeedsReview('微信已有打开的菜单，请先关闭后再继续。')
     identity = rid(row)
     rect = row.BoundingRectangle
+    current_rect = (rect.left, rect.top, rect.right, rect.bottom)
+    if current_rect != tuple(observed_rect):
+        raise NeedsReview('图片位置在检查菜单前发生变化，已暂停。')
     scale = dpi / 96
-    thumb = source.copy()
-    thumb.thumbnail((round(240 * scale), round(240 * scale)))
-    x = rect.right - round(70 * scale) - thumb.width / 2
-    y = rect.top + round(8 * scale) + thumb.height / 2
-    # The caller must first verify this source thumbnail in this exact row.
-    if not (rect.left < x < rect.right and rect.top < y < rect.bottom):
-        raise NeedsReview('图片菜单定位超出当前消息范围。')
+    x, y = image_menu_point(current_rect, thumbnail_bounds)
     click_point(binding['hwnd'], binding['pid'], x, y, right=True, stop=backend.stop)
     menus = {}
     try:

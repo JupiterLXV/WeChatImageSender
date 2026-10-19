@@ -1,7 +1,9 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from sender.core import State
-from sender.qt_menu import completed_image_menu
+from sender.core import NeedsReview, State
+from sender.qt_menu import completed_image_menu, image_menu_point, read_image_menu
 
 
 def menu(names):
@@ -13,6 +15,26 @@ UPLOADING = ['转发...', '多选', '用窗口打开', '删除']
 
 
 class MenuTests(unittest.TestCase):
+    def test_menu_uses_the_matched_bounds(self):
+        self.assertEqual(image_menu_point((695, 205, 1397, 378), (305, 11, 612, 159)),
+                         (1153.5, 290))
+
+    def test_missing_or_outside_match_cannot_open_menu(self):
+        for bounds in (None, (-1, 11, 612, 159), (305, 11, 703, 159), (305, 11, 612, 174)):
+            with self.assertRaises(NeedsReview):
+                image_menu_point((695, 205, 1397, 378), bounds)
+
+    def test_row_moved_after_capture_blocks_click(self):
+        backend = Mock(stop=None, assert_target=Mock())
+        row = Mock()
+        row.GetRuntimeId.return_value = [42, 1]
+        row.BoundingRectangle = SimpleNamespace(left=695, top=206, right=1397, bottom=379)
+        with patch('sender.qt_menu._menus', return_value={}), patch('sender.qt_menu.click_point') as click:
+            with self.assertRaisesRegex(NeedsReview, '位置'):
+                read_image_menu(backend, {'pid': 1}, row, (305, 11, 612, 159), 120,
+                                (695, 205, 1397, 378))
+            click.assert_not_called()
+
     def test_measured_upload_menu_never_confirms(self):
         for state in State:
             self.assertFalse(completed_image_menu(menu(UPLOADING), state, '4.1.15.53'))

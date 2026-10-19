@@ -439,7 +439,8 @@ class WeChatBackend:
                                        '已观察到本条图片上传，当前图片匹配且上传指示已消失；等待状态稳定')
                 if result.state == State.CLEAR and result.matched:
                     from .qt_menu import read_image_menu, completed_image_menu
-                    items = read_image_menu(self, binding, row, self._source_images[path], dpi)
+                    items = read_image_menu(self, binding, row, result.thumbnail_bounds, dpi,
+                                            (rect.left, rect.top, rect.right, rect.bottom))
                     if completed_image_menu(items, result.state, self._version):
                         return Observation(token['id'], State.SENT,
                                            '本条图片内容匹配，上传指示已清空，且完成后菜单操作均已可用')

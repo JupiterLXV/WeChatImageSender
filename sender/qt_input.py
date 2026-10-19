@@ -17,11 +17,14 @@ user32.WindowFromPoint.argtypes = [wintypes.POINT]
 user32.WindowFromPoint.restype = wintypes.HWND
 
 
-def click_point(hwnd, pid, x, y, right=False, stop=None):
-    if stop is not None and stop.is_set():
-        raise Stopped('已停止，尚未操作微信。')
-    if user32.GetForegroundWindow() != hwnd:
-        raise NeedsReview('微信失去前台焦点，未执行鼠标操作。')
+def _point_owned_by(point, pid):
+    hit = user32.WindowFromPoint(point)
+    owner = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hit, ctypes.byref(owner))
+    return owner.value == pid
+
+
+def _render_windows(hwnd):
     renders = []
     def collect(handle, unused):
         name = ctypes.create_unicode_buffer(256)
@@ -31,24 +34,37 @@ def click_point(hwnd, pid, x, y, right=False, stop=None):
         return True
     collect(hwnd, 0)
     user32.EnumChildWindows(hwnd, _callback(collect), 0)
+    return renders
+
+
+def click_point(hwnd, pid, x, y, right=False, stop=None):
+    if stop is not None and stop.is_set():
+        raise Stopped('已停止，尚未操作微信。')
+    if user32.GetForegroundWindow() != hwnd:
+        raise NeedsReview('微信失去前台焦点，未执行鼠标操作。')
+    point = wintypes.POINT(round(x), round(y))
     saved = []
     try:
-        for handle in renders:
-            style = user32.GetWindowLongPtrW(handle, -20)
-            if style & 0x20:
-                saved.append((handle, style))
-                user32.SetWindowLongPtrW(handle, -20, style & ~0x20)
-        point = wintypes.POINT(round(x), round(y))
-        hit = user32.WindowFromPoint(point)
-        owner = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hit, ctypes.byref(owner))
-        if owner.value != pid or user32.GetForegroundWindow() != hwnd:
+        # Normally the transparent renderer lets input reach Qt's main window.
+        # Making that renderer opaque would intercept and swallow the click.
+        # Use the existing route whenever the point already belongs to WeChat.
+        if not _point_owned_by(point, pid):
+            for handle in _render_windows(hwnd):
+                style = user32.GetWindowLongPtrW(handle, -20)
+                if style & 0x20:
+                    saved.append((handle, style))
+                    user32.SetWindowLongPtrW(handle, -20, style & ~0x20)
+        if not _point_owned_by(point, pid) or user32.GetForegroundWindow() != hwnd:
             raise NeedsReview('目标位置被其他窗口遮挡，未执行鼠标操作。')
         if stop is not None and stop.is_set():
             raise Stopped('已停止。')
-        user32.SetCursorPos(point.x, point.y)
+        if not user32.SetCursorPos(point.x, point.y):
+            raise NeedsReview('无法定位鼠标，未执行点击。')
         user32.mouse_event(8 if right else 2, 0, 0, 0, 0)
-        user32.mouse_event(16 if right else 4, 0, 0, 0, 0)
+        try:
+            time.sleep(0.05)
+        finally:
+            user32.mouse_event(16 if right else 4, 0, 0, 0, 0)
         time.sleep(0.1)
     finally:
         for handle, style in reversed(saved):
