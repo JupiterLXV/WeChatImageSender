@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
 
-from PIL import Image
+from .images import UnsupportedFrames, verify_static
 
 EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff', '.gif'}
 
@@ -116,10 +116,9 @@ def scan_folder(folder: Path, recursive: bool, include_extension: bool,
         if any(ord(c) < 32 for c in path.name):
             raise SenderError(f'文件名包含换行等控制字符：{path.name!r}')
         try:
-            with Image.open(path) as image:
-                if getattr(image, 'n_frames', 1) != 1:
-                    raise SenderError(f'{path.name} 是动图或多页图片，请先转换为单张静态图片。')
-                image.verify()
+            verify_static(path)
+        except UnsupportedFrames as exc:
+            raise SenderError(f'{path.name} {exc}') from exc
         except SenderError:
             raise
         except Exception as exc:

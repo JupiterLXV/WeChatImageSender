@@ -8,9 +8,10 @@ Screenshots are processed in memory and are not saved by the application.
 from dataclasses import dataclass
 import math
 
-from PIL import Image, ImageChops, ImageOps, ImageStat
+from PIL import Image, ImageChops, ImageStat
 
 from .core import State
+from .images import load_rgb
 
 
 @dataclass(frozen=True)
@@ -21,11 +22,7 @@ class VisualResult:
 
 
 def prepare_source(path):
-    with Image.open(path) as source:
-        rgba = ImageOps.exif_transpose(source).convert('RGBA')
-        result = Image.new('RGB', rgba.size, 'white')
-        result.paste(rgba, mask=rgba.getchannel('A'))
-        return result
+    return load_rgb(path)
 
 
 def image_state(frame: Image.Image, source: Image.Image, dpi: int, version: str) -> VisualResult:

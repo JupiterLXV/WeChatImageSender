@@ -106,7 +106,7 @@ class Application:
             box.pack(side='left', padx=(0, 15))
             self.controls.append(box)
         self.button(opts, '重新读取', self.scan).pack(side='right')
-        ttk.Label(files, text='按文件名自然排序：1、2、10。支持常见静态图片；不修改原文件。',
+        ttk.Label(files, text='按文件名自然排序：1、2、10。JPG 附带多图数据时仅发送主图；不修改原文件。',
                   foreground='#566778').pack(anchor='w', pady=(6, 0))
 
         targets = ttk.LabelFrame(outer, text='2  选择好友或群聊', padding=10)

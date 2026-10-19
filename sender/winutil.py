@@ -6,9 +6,8 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-from PIL import Image, ImageOps
-
 from .core import SenderError
+from .images import load_rgb
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -143,11 +142,7 @@ def copy_text(text: str):
 
 
 def copy_image(path: Path):
-    with Image.open(path) as source:
-        image = ImageOps.exif_transpose(source).convert('RGBA')
-        # Windows DIB is sent as an image; transparent pixels use a white background.
-        background = Image.new('RGB', image.size, 'white')
-        background.paste(image, mask=image.getchannel('A'))
-        stream = io.BytesIO()
-        background.save(stream, 'BMP')
-        clipboard(stream.getvalue()[14:], 8)
+    image = load_rgb(path)
+    stream = io.BytesIO()
+    image.save(stream, 'BMP')
+    clipboard(stream.getvalue()[14:], 8)

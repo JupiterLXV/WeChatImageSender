@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-APP_VERSION = '2.0.0'
+APP_VERSION = '2.0.1'
 TARGET_VERSION = '4.1.15'
 DOWNLOAD_URL = 'https://pc.weixin.qq.com/'
 UPDATE_REMINDER = '使用前请将电脑微信更新到官方最新版本。本程序适配 Windows 微信 4.1.15。'
