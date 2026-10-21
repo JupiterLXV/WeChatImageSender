@@ -1,0 +1,60 @@
+name: Build Windows Executable & Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Build WeChatImageSender.exe and package ZIP
+        shell: pwsh
+        run: |
+          pwsh -ExecutionPolicy Bypass -File ./build.ps1
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeChatImageSender-Windows-x64
+          path: dist/WeChatImageSender-Windows-x64.zip
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v3.0.0
+          name: "WeChatImageSender v3.0.0 (零内存补丁 · CF_HDROP 原图加速版)"
+          files: dist/WeChatImageSender-Windows-x64.zip
+          generate_release_notes: true
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
