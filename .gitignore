@@ -17,7 +17,7 @@ ENV/
 # Build outputs; keep the reviewed PyInstaller specification in source control
 build/
 dist/
-releases/
+/releases/
 *.spec
 !WeChatImageSender.spec
 *.exe
