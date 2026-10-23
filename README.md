@@ -2,7 +2,7 @@
   <img src="assets/app-icon-64.png" width="64" height="64" alt="微信图片顺序发送助手 Logo">
 </p>
 
-# 微信图片顺序发送助手 · v3.6.0
+# 微信图片顺序发送助手 · v3.6.1
 
 面向 Windows 桌面微信的图片队列工具。按照 **图片 → 客户端状态核实 → 图片名称** 逐张处理，支持暂停、人工核实和历史任务恢复。
 
@@ -111,6 +111,6 @@ WeChatImageSender_v3.py        兼容启动入口，转到 main.py
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-默认发行输出目录为 `releases/3.6.0/`。使用打包后的程序时应完整解压并保留配套资源，不要只复制 `.exe`。本地构建成功不代表 GitHub Release 已发布。
+默认发行输出目录为 `releases/3.6.1/`。使用打包后的程序时应完整解压并保留配套资源，不要只复制 `.exe`。本地构建成功不代表 GitHub Release 已发布。
 
 贡献与测试边界见 [开发说明](docs/DEVELOPMENT.md)，版本改动见 [变更记录](docs/CHANGELOG.md)。

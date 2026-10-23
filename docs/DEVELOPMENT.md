@@ -1,6 +1,6 @@
 # 开发说明
 
-本项目面向 Windows 10/11 桌面微信。v3.6.0 的 Windows 7 风格是视觉参考，不代表 Windows 7 运行兼容性。主要维护模块化源码，避免在兼容入口中复制实现。
+本项目面向 Windows 10/11 桌面微信。Windows 7 风格是视觉参考，不代表 Windows 7 运行兼容性。主要维护模块化源码，避免在兼容入口中复制实现。
 
 ## 环境与启动
 
@@ -55,7 +55,7 @@ py -3 -m venv .venv
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-构建使用 `WeChatImageSender.spec`，默认发行产物输出到 `releases/3.6.0/`。仅复制 `.exe` 可能缺少运行依赖，应完整交付输出目录或压缩包。以当前构建脚本及 CI 日志确认产物，不把本地构建成功描述成 GitHub Release 已发布。
+构建使用 `WeChatImageSender.spec`，默认发行产物输出到 `releases/3.6.1/`。仅复制 `.exe` 可能缺少运行依赖，应完整交付输出目录或压缩包。以当前构建脚本及 CI 日志确认产物，不把本地构建成功描述成 GitHub Release 已发布。
 
 根目录 `WeChatImageSender_v3.py` 是转到 `main.py` 的兼容启动入口，需要项目其他模块。需要独立脚本时执行：
 

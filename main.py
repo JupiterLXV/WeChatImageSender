@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微信图片顺序发送助手 v3.6.0 入口程序
+微信图片顺序发送助手 v3.6.1 入口程序
 支持：
 - GUI 模式：`python main.py`
 - 演示模式：`python main.py --demo`（或 `--demo --headless` 在无显示器环境自动跑完演示队列）
@@ -36,7 +36,7 @@ def run_diagnose(output_path: str | None, demo: bool = False) -> int:
 
 
 def run_headless_demo() -> int:
-    print("=== 微信图片顺序发送助手 v3.6.0 演示队列（Headless 模式）===")
+    print("=== 微信图片顺序发送助手 v3.6.1 演示队列（Headless 模式）===")
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         for idx, color in [(1, (220, 60, 60)), (2, (60, 180, 90)), (10, (60, 100, 220))]:
@@ -57,7 +57,7 @@ def run_headless_demo() -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="微信图片顺序发送助手 v3.6.0")
+    parser = argparse.ArgumentParser(description="微信图片顺序发送助手 v3.6.1")
     parser.add_argument("--demo", action="store_true", help="以离线演示模式启动，不连接真实微信")
     parser.add_argument("--headless", action="store_true", help="配合 --demo 在命令行直接演示完整队列")
     parser.add_argument("--diagnose", action="store_true", help="只读检测微信版本与窗口状态，不修改内存、不发消息")
@@ -78,7 +78,7 @@ def main() -> int:
     if sys.platform == "win32":
         import ctypes
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("WeChatImageSender.Desktop.3.6")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("WeChatImageSender.Desktop.3.6.1")
         except OSError:
             pass
     root = tk.Tk()
