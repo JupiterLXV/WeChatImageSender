@@ -169,7 +169,7 @@ class DesktopLayoutMixin:
         self._label(self.source_band, "发送到").grid(row=0, column=2, sticky="w")
         self.chat_combo = ttk.Combobox(self.source_band, width=21)
         self.chat_combo.grid(row=0, column=3, padx=(8, 7), sticky="ew")
-        self.current_chat_btn = ttk.Button(self.source_band, text="使用当前聊天", style="Secondary.TButton", command=self.use_current_chat)
+        self.current_chat_btn = ttk.Button(self.source_band, text="刷新/定位聊天", style="Secondary.TButton", command=self.refresh_chats)
         self.current_chat_btn.grid(row=0, column=4)
         self._edit_controls.append(self.current_chat_btn)
 

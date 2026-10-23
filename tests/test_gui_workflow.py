@@ -458,7 +458,7 @@ class TestWorkflowInvariants(unittest.TestCase):
             diagnose=lambda: calls.append("diagnose") or SimpleNamespace(wechat_running=True, dpi_scale_percent=100),
             list_recent_chats=lambda: ["Wrong recent"],
         )
-        self.app.refresh_chats()
+        self.app._refresh_connection_async()
         self.assertEqual(calls, [])
         self.app.current_job = job("Locked saved chat")
         ControlledThread.created[-1].run()
@@ -466,6 +466,97 @@ class TestWorkflowInvariants(unittest.TestCase):
         self.assertEqual(calls, ["diagnose"])
         self.assertEqual(self.app.chat_combo.get(), "Locked saved chat")
         self.assertFalse(self.app._connection_busy)
+
+    def test_background_connection_check_never_selects_or_lists_chats(self):
+        self.app.chat_combo.set("")
+        self.app.chat_combo["values"] = ["Previously listed"]
+        self.app.adapter = SimpleNamespace(
+            diagnose=lambda: SimpleNamespace(wechat_running=True, dpi_scale_percent=100),
+            list_recent_chats=lambda: self.fail("Polling must not refresh the recipient list"),
+            get_current_chat_title=lambda: self.fail("Polling must not select a current chat"),
+        )
+        self.app._refresh_connection_async()
+        ControlledThread.created[-1].run()
+        self.app.root.flush()
+        self.assertTrue(self.app.connected)
+        self.assertEqual(self.app.chat_combo.get(), "")
+        self.assertEqual(self.app.chat_combo.values, ["Previously listed"])
+
+    def test_manual_refresh_locates_the_open_chat_without_activating_or_searching(self):
+        self.app.adapter = SimpleNamespace(
+            diagnose=lambda: SimpleNamespace(wechat_running=True, dpi_scale_percent=100),
+            list_recent_chats=lambda: ["文件传输助手", "Another chat"],
+            get_current_chat_title=lambda: "Manually opened recipient",
+            activate_chat=lambda *_args: self.fail("Locating must not activate WeChat"),
+            search_and_switch_chat=lambda *_args: self.fail("Locating must not switch conversations"),
+        )
+        self.app.refresh_chats()
+        self.assertEqual(self.app.chat_combo.get(), "Draft recipient")
+        ControlledThread.created[-1].run()
+        self.app.root.flush()
+        self.assertEqual(self.app.chat_combo.get(), "Manually opened recipient")
+        self.assertEqual(self.app.chat_combo.values[0], "Manually opened recipient")
+        self.assertIn("手动打开", self.app.status_var.get())
+
+    def test_manual_refresh_accepts_original_current_chat_fallback(self):
+        self.app.adapter = SimpleNamespace(
+            diagnose=lambda: SimpleNamespace(wechat_running=True, dpi_scale_percent=100),
+            list_recent_chats=lambda: ["文件传输助手"],
+            get_current_chat_title=lambda: "当前微信聊天",
+        )
+        self.app.use_current_chat()
+        ControlledThread.created[-1].run()
+        self.app.root.flush()
+        self.assertEqual(self.app.chat_combo.get(), "当前微信聊天")
+
+    def test_manual_refresh_waits_for_background_check_instead_of_being_dropped(self):
+        calls = []
+        self.app.adapter = SimpleNamespace(
+            diagnose=lambda: calls.append("diagnose") or SimpleNamespace(wechat_running=True, dpi_scale_percent=100),
+            list_recent_chats=lambda: calls.append("list") or ["文件传输助手"],
+            get_current_chat_title=lambda: calls.append("current") or "Manually selected",
+        )
+        self.app._refresh_connection_async()
+        background = ControlledThread.created[-1]
+        self.app.refresh_chats()
+        self.assertTrue(self.app._connection_manual_pending)
+        self.assertEqual(len(ControlledThread.created), 1)
+        background.run()
+        self.app.root.flush()
+        self.assertEqual(calls, ["diagnose"])
+        self.assertEqual(len(ControlledThread.created), 2)
+        self.assertTrue(self.app._connection_busy)
+        ControlledThread.created[-1].run()
+        self.app.root.flush()
+        self.assertEqual(calls, ["diagnose", "diagnose", "list", "current"])
+        self.assertEqual(self.app.chat_combo.get(), "Manually selected")
+        self.assertFalse(self.app._connection_busy)
+        self.assertFalse(self.app._connection_manual_pending)
+
+    def test_missing_wechat_does_not_replace_manually_selected_recipient(self):
+        self.app.adapter = SimpleNamespace(
+            diagnose=lambda: SimpleNamespace(wechat_running=False, dpi_scale_percent=100),
+            list_recent_chats=lambda: self.fail("No WeChat window is available"),
+            get_current_chat_title=lambda: self.fail("No WeChat window is available"),
+        )
+        self.app.refresh_chats()
+        ControlledThread.created[-1].run()
+        self.app.root.flush()
+        self.assertEqual(self.app.chat_combo.get(), "Draft recipient")
+        self.assertIn("刷新/定位聊天", self.app.status_var.get())
+
+    def test_new_task_invalidates_an_inflight_manual_recipient_lookup(self):
+        self.app.adapter = SimpleNamespace(
+            diagnose=lambda: SimpleNamespace(wechat_running=True, dpi_scale_percent=100),
+            list_recent_chats=lambda: ["Old task recipient"],
+            get_current_chat_title=lambda: "Old task recipient",
+        )
+        self.app.refresh_chats()
+        worker = ControlledThread.created[-1]
+        self.app.new_task()
+        worker.run()
+        self.app.root.flush()
+        self.assertEqual(self.app.chat_combo.get(), "Draft recipient")
 
     def test_new_task_invalidates_scan_and_preserves_engine_history(self):
         self.app.current_job = job()

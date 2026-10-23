@@ -27,6 +27,7 @@ class SenderWorkflowMixin:
             "_run_generation": 0,
             "_connection_busy": False,
             "_connection_generation": 0,
+            "_connection_manual_pending": False,
             "_run_completed_baseline": 0,
             "_run_end_ts": None,
             "_last_progress_preview_index": None,
@@ -102,6 +103,8 @@ class SenderWorkflowMixin:
             return
         self._scan_generation += 1
         self._scan_busy = False
+        self._connection_generation += 1
+        self._connection_manual_pending = False
         self._clear_task_evidence()
         self._clear_scan_source()
         self.current_job = None
@@ -474,7 +477,7 @@ class SenderWorkflowMixin:
             messagebox.showerror("加载失败", str(exc))
 
     def refresh_chats(self) -> None:
-        self._refresh_connection_async()
+        self.use_current_chat()
 
     def use_current_chat(self) -> None:
         if self._allow_draft_edit():
@@ -482,7 +485,12 @@ class SenderWorkflowMixin:
 
     def _refresh_connection_async(self, use_current: bool = False) -> None:
         self._workflow_state()
-        if self._closing or getattr(self, "_shutdown_pending", False) or self._sender_running() or self._connection_busy:
+        if self._closing or getattr(self, "_shutdown_pending", False) or self._sender_running():
+            return
+        if self._connection_busy:
+            if use_current:
+                self._connection_manual_pending = True
+                self.status_var.set("正在检查微信连接，完成后将刷新并定位你手动打开的聊天。")
             return
         self._connection_busy = True
         self._sync_task_controls()
@@ -490,7 +498,8 @@ class SenderWorkflowMixin:
 
         def apply(diag: Any, chats: list, current: str, error: str) -> None:
             self._connection_busy = False
-            if self._closing or self._sender_running():
+            if self._closing or getattr(self, "_shutdown_pending", False) or self._sender_running():
+                self._connection_manual_pending = False
                 return
             if error:
                 self._set_connection_pill(False, "未检测到微信 · 点击重试")
@@ -502,25 +511,29 @@ class SenderWorkflowMixin:
                     f"微信已连接 · {diag.dpi_scale_percent}% DPI" if connected else "未检测到微信 · 点击重试"
                 )
                 self._set_connection_pill(connected, label)
-                self.chat_combo["values"] = chats
-                if generation == self._connection_generation and self.current_job is None:
-                    if use_current:
-                        if connected and current:
-                            self.chat_combo.set(current)
-                            self.status_var.set(f"已选择当前微信会话：{current}")
-                        else:
-                            self.status_var.set("请先打开微信并进入接收对象的聊天窗口。")
-                    elif chats and not self.chat_combo.get():
-                        self.chat_combo.set(chats[0])
+                # Polling only reports whether WeChat is running. The user
+                # chooses a conversation in WeChat, then explicitly locates it.
+                if use_current and generation == self._connection_generation and self.current_job is None:
+                    if connected and current:
+                        self.chat_combo["values"] = list(dict.fromkeys([current, *chats]))
+                        self.chat_combo.set(current)
+                        self.status_var.set(f"已定位你手动打开的微信聊天：{current}")
+                        self._append_log(f"已定位当前微信聊天：{current}")
+                    else:
+                        self.status_var.set("请先在微信中手动打开接收对象的聊天，再点击“刷新/定位聊天”。")
             self._sync_task_controls()
+            if self._connection_manual_pending:
+                self._connection_manual_pending = False
+                if self.current_job is None:
+                    self._refresh_connection_async(use_current=True)
 
         def work() -> None:
             try:
                 from .gui import _uia_thread_scope
                 with _uia_thread_scope():
                     diag = self.adapter.diagnose()
-                    chats = self.adapter.list_recent_chats()
-                    current = self.adapter.get_current_chat_title() if use_current and diag.wechat_running else ""
+                    chats = self.adapter.list_recent_chats() if use_current and diag.wechat_running else []
+                    current = (self.adapter.get_current_chat_title() or "当前微信聊天") if use_current and diag.wechat_running else ""
                 self._post_ui(lambda: apply(diag, chats, current, ""))
             except Exception as exc:
                 reason = str(exc)

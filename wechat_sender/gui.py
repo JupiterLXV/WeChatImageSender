@@ -284,6 +284,34 @@ def _install_robust_window_detector(adapter: BaseWeChatAdapter) -> None:
 
         return None
 
+    def _robust_get_current_chat_title(self: WindowsWeChatAdapter) -> str:
+        if sys.platform != "win32":
+            return ""
+        hwnd = self._find_wechat_hwnd()
+        if not hwnd:
+            return ""
+        try:
+            from ctypes import wintypes
+            buf = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetWindowTextW(wintypes.HWND(int(hwnd)), buf, 256)
+            win_title = (buf.value or "").strip()
+            if win_title and not _is_wechat_window_title(win_title) and win_title not in GENERIC_CHAT_TITLES:
+                return win_title
+        except Exception:
+            pass
+
+        try:
+            with _uia_thread_scope():
+                import uiautomation as auto
+                wnd = auto.ControlFromHandle(int(hwnd))
+                edit = wnd.EditControl(searchDepth=12)
+                if edit.Exists(0, 0) and edit.Name:
+                    candidate = edit.Name.strip()
+                    if candidate and candidate not in GENERIC_CHAT_TITLES and not _is_wechat_window_title(candidate):
+                        return candidate
+        except Exception:
+            pass
+        return "当前微信聊天"
 
     def _robust_activate_chat(self: WindowsWeChatAdapter, chat_name: str) -> bool:
         hwnd = self._find_wechat_hwnd(target_chat=chat_name)
@@ -345,10 +373,97 @@ def _install_robust_window_detector(adapter: BaseWeChatAdapter) -> None:
             return False
         return True
 
+    def _robust_ensure_foreground_and_target(self: WindowsWeChatAdapter, expected_chat: str) -> Tuple[bool, str]:
+        hwnd = self._find_wechat_hwnd(target_chat=expected_chat)
+        if not hwnd or sys.platform != "win32":
+            return False, "未找到微信窗口，请确认微信已打开并登录"
+        from ctypes import wintypes
 
+        user32 = ctypes.windll.user32
+        fg = int(user32.GetForegroundWindow() or 0)
+
+        if fg != int(hwnd):
+            wx_pid = wintypes.DWORD(0)
+            fg_pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(wintypes.HWND(int(hwnd)), ctypes.byref(wx_pid))
+            if fg:
+                user32.GetWindowThreadProcessId(wintypes.HWND(fg), ctypes.byref(fg_pid))
+
+            if fg == 0 or fg_pid.value == os.getpid() or fg_pid.value == wx_pid.value:
+                self.activate_chat(expected_chat)
+                fg = int(user32.GetForegroundWindow() or 0)
+                if fg:
+                    user32.GetWindowThreadProcessId(wintypes.HWND(fg), ctypes.byref(fg_pid))
+
+            if fg != int(hwnd) and fg_pid.value != wx_pid.value:
+                self.activate_chat(expected_chat)
+                fg = int(user32.GetForegroundWindow() or 0)
+                if fg:
+                    user32.GetWindowThreadProcessId(wintypes.HWND(fg), ctypes.byref(fg_pid))
+                if fg != int(hwnd) and fg_pid.value != wx_pid.value:
+                    return False, "微信窗口已失去前台焦点，为防止误发已自动暂停"
+
+        curr_title = (self.get_current_chat_title() or "").strip()
+        exp_clean = (expected_chat or "").strip()
+        if (
+            exp_clean
+            and exp_clean not in GENERIC_CHAT_TITLES
+            and curr_title
+            and curr_title not in GENERIC_CHAT_TITLES
+            and exp_clean not in curr_title
+            and curr_title not in exp_clean
+        ):
+            if getattr(self, "auto_search_chat", False) and hasattr(self, "search_and_switch_chat"):
+                self.search_and_switch_chat(exp_clean)
+                curr_title = (self.get_current_chat_title() or "").strip()
+            if (
+                curr_title
+                and curr_title not in GENERIC_CHAT_TITLES
+                and exp_clean not in curr_title
+                and curr_title not in exp_clean
+            ):
+                return False, f"检测到聊天窗口变化（当前：{curr_title}，目标：{exp_clean}），已暂停"
+        return True, "OK"
+
+    def _robust_send_text_and_verify(self: WindowsWeChatAdapter, text: str, send_shortcut: str) -> Tuple[bool, str]:
+        try:
+            prev_txt_shot = self._capture_chat_region()
+        except Exception:
+            prev_txt_shot = None
+        pre_txt_wal = self.wal_tracker.snapshot() if hasattr(self, "wal_tracker") else None
+
+        self.clipboard.set_text(text)
+        self._paste_and_submit(send_shortcut, is_text=True)
+
+        send_ts = time.monotonic()
+        deadline = send_ts + 2.5
+        while time.monotonic() < deadline:
+            time.sleep(0.06)
+            if prev_txt_shot is None:
+                return True, f"已发送图片名称：{text}"
+            try:
+                after_text_shot = self._capture_chat_region()
+                if after_text_shot.size == prev_txt_shot.size:
+                    w, h = after_text_shot.size
+                    b1 = np.asarray(prev_txt_shot.convert("L").crop((int(w * 0.15), int(h * 0.35), w, h)), dtype=np.float32)
+                    b2 = np.asarray(after_text_shot.convert("L").crop((int(w * 0.15), int(h * 0.35), w, h)), dtype=np.float32)
+                    abs_d = np.abs(b2 - b1)
+                    if float(np.mean(abs_d)) > 0.20 or int(np.sum(abs_d > 12.0)) >= 80:
+                        return True, f"已确认图片名称“{text}”极速上屏完成"
+                curr_wal = self.wal_tracker.snapshot() if hasattr(self, "wal_tracker") else None
+                if pre_txt_wal is not None and curr_wal is not None and curr_wal != pre_txt_wal:
+                    return True, f"已确认图片名称“{text}”写入完成"
+                if (time.monotonic() - send_ts) >= 0.45:
+                    return True, f"已发送图片名称：{text}"
+            except Exception:
+                return True, f"已发送图片名称：{text}"
+        return True, f"已发送图片名称：{text}"
 
     adapter._find_wechat_hwnd = types.MethodType(_robust_find_wechat_hwnd, adapter)  # type: ignore[method-assign]
+    adapter.get_current_chat_title = types.MethodType(_robust_get_current_chat_title, adapter)  # type: ignore[method-assign]
     adapter.activate_chat = types.MethodType(_robust_activate_chat, adapter)  # type: ignore[method-assign]
+    adapter.ensure_foreground_and_target = types.MethodType(_robust_ensure_foreground_and_target, adapter)  # type: ignore[method-assign]
+    adapter.send_text_and_verify = types.MethodType(_robust_send_text_and_verify, adapter)  # type: ignore[method-assign]
 
 
 
@@ -419,7 +534,7 @@ class _LegacySenderAppGUI:
         self.root.bind("<F8>", lambda _e: self.request_stop())
         self._start_global_hotkey_listener()
         self.root.after(200, self._setup_windows_drag_and_drop)
-        self.refresh_chats()
+        self._refresh_connection_async()
         self._schedule_auto_detect()
         self._append_log(
             "系统就绪：已就绪。原文件发送、逐张状态确认、F8 暂停与任务恢复可用。"

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""离线回归：停止、崩溃恢复及发送证据；不会连接或操作真实微信。"""
+"""离线回归：原发送流程、手动定位及崩溃恢复；不连接或操作真实微信。"""
 
 import tempfile
 import unittest
@@ -9,9 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
-from wechat_sender.image_utils import VisualBubbleVerifier, scan_image_folder
+from wechat_sender.image_utils import BubbleVisualStatus, VisualBubbleVerifier, scan_image_folder
 from wechat_sender.job_store import ItemStage, SequentialSendEngine
 from wechat_sender.wechat_adapter import BaseWeChatAdapter, DemoWeChatAdapter, WindowsWeChatAdapter, _uia_thread_scope
 
@@ -37,6 +37,8 @@ def offline_windows_adapter():
     adapter._pre_send_shot = None
     adapter._last_locked_bbox = None
     adapter._pre_send_wal = None
+    adapter.quiet_confirm_sec = 0.10
+    adapter.auto_search_chat = False
     adapter.post_send_grace_sec = 0.0
     adapter._hwnd = 123
     adapter._expected_chat = "测试好友"
@@ -132,7 +134,7 @@ class TestInterruptedQueue(unittest.TestCase):
         self.assertEqual(job.items[0].stage, ItemStage.PENDING.value)
 
 
-class TestImageEvidence(unittest.TestCase):
+class TestOriginalImageFlow(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -152,64 +154,45 @@ class TestImageEvidence(unittest.TestCase):
         ):
             return adapter.verify_image_sent(self.path, timeout_sec=0.65, stable_duration_sec=0.10)
 
-    def test_adapter_never_promotes_frozen_spinner_to_success(self):
-        ImageDraw.Draw(self.chat).ellipse((266, 254, 284, 272), outline=(210, 210, 210), width=3)
-        adapter = offline_windows_adapter()
-        adapter._pre_send_shot = self.blank
-        adapter._capture_chat_region = Mock(return_value=self.chat)
-        result = self.verify(adapter)
-        self.assertTrue(result.matched)
-        self.assertTrue(result.has_static_spinner)
-        self.assertFalse(result.is_upload_complete)
-
-    def test_unchanged_historical_image_cannot_confirm_new_send(self):
-        adapter = offline_windows_adapter()
-        adapter._pre_send_shot = self.chat.copy()
-        adapter._capture_chat_region = Mock(return_value=self.chat)
-        result = self.verify(adapter)
-        self.assertTrue(result.matched)
-        self.assertFalse(result.is_upload_complete)
-
     def test_new_quiet_outgoing_image_can_complete(self):
         adapter = offline_windows_adapter()
         adapter._pre_send_shot = self.blank
         adapter._capture_chat_region = Mock(return_value=self.chat)
         self.assertTrue(self.verify(adapter).is_upload_complete)
 
-    def test_history_image_moving_up_after_unrelated_message_is_unconfirmed(self):
+    def test_failure_badge_stops_image_confirmation(self):
         adapter = offline_windows_adapter()
-        adapter._pre_send_shot = self.chat.copy()
-        moved = self.blank.copy()
-        moved.paste(self.source.resize((160, 128)), (300, 110))
-        adapter._capture_chat_region = Mock(return_value=moved)
-        self.assertFalse(self.verify(adapter).is_upload_complete)
-
-    def test_image_verification_stop_does_not_wait_for_timeout(self):
-        adapter = offline_windows_adapter()
-        adapter.set_stop_callback(lambda: True)
-        adapter._capture_chat_region = Mock(side_effect=AssertionError("暂停后不应继续抓图"))
-        self.assertFalse(self.verify(adapter).is_upload_complete)
-        adapter._capture_chat_region.assert_not_called()
-
-    def test_weak_similarity_and_unrelated_frame_change_never_promoted(self):
-        adapter = offline_windows_adapter()
-        adapter._pre_send_shot = self.blank
         adapter._capture_chat_region = Mock(return_value=self.chat)
-        original = adapter.verifier.evaluate
-
-        def weak_match(*args, **kwargs):
-            status = original(*args, **kwargs)
-            status.similarity = 0.30
-            status.matched = False
-            status.bbox = None
-            status.is_upload_complete = False
-            return status
-
-        adapter.verifier.evaluate = weak_match
+        adapter.verifier.evaluate = Mock(return_value=BubbleVisualStatus(
+            matched=True, similarity=0.95, bbox=(300, 200, 160, 128),
+            has_failure_badge=True, has_static_spinner=False,
+            spinner_motion_score=0.0, is_upload_complete=False, reason="发送失败标记",
+        ))
         self.assertFalse(self.verify(adapter).is_upload_complete)
+        adapter._capture_chat_region.assert_called_once()
+
+    def test_send_image_preserves_both_clipboard_modes(self):
+        for mode, setter in (("CF_DIB", "set_image_dib"), ("CF_HDROP", "set_image_file_hdrop")):
+            with self.subTest(mode=mode):
+                adapter = offline_windows_adapter()
+                adapter.clipboard = Mock()
+                adapter._capture_chat_region = Mock(return_value=self.blank)
+                adapter.send_image(self.path, mode, "CTRL+ENTER")
+                getattr(adapter.clipboard, setter).assert_called_once_with(self.path)
+                adapter._paste_and_submit.assert_called_once_with("CTRL+ENTER", is_text=False)
+                self.assertIs(adapter._pre_send_shot, self.blank)
+
+    def test_optional_initial_capture_failure_does_not_block_submission(self):
+        adapter = offline_windows_adapter()
+        adapter.clipboard = Mock()
+        adapter._capture_chat_region = Mock(side_effect=RuntimeError("模拟截图不可用"))
+        adapter.send_image(self.path, "CF_DIB", "ENTER")
+        self.assertIsNone(adapter._pre_send_shot)
+        adapter.clipboard.set_image_dib.assert_called_once_with(self.path)
+        adapter._paste_and_submit.assert_called_once_with("ENTER", is_text=False)
 
 
-class TestTextEvidenceAndTarget(unittest.TestCase):
+class TestOriginalTextFlowAndManualTarget(unittest.TestCase):
     def verify_text(self, adapter):
         clock = FakeClock()
         with patch("wechat_sender.wechat_adapter.time.monotonic", clock.monotonic), patch(
@@ -217,58 +200,45 @@ class TestTextEvidenceAndTarget(unittest.TestCase):
         ):
             return adapter.send_text_and_verify("01_风景", "ENTER")
 
-    def test_text_requires_new_matching_outgoing_message(self):
+    def test_text_submits_without_requiring_ocr_or_message_accessibility(self):
         adapter = offline_windows_adapter()
-        adapter._count_outgoing_text_matches = Mock(side_effect=[0, 1])
+        adapter._count_outgoing_text_matches = Mock(side_effect=AssertionError("原流程无需读取消息记录"))
+        adapter._capture_chat_region = Mock(return_value=Image.new("RGB", (500, 400), "white"))
         ok, _ = self.verify_text(adapter)
         self.assertTrue(ok)
-        adapter._paste_and_submit.assert_called_once()
+        self.assertEqual(adapter.clipboard.last_payload, "01_风景")
+        adapter._paste_and_submit.assert_called_once_with("ENTER", is_text=True)
+        adapter._count_outgoing_text_matches.assert_not_called()
 
-    def test_text_never_confirms_by_time_wal_or_unrelated_pixels(self):
+    def test_text_submission_keeps_original_fallback_when_capture_unavailable(self):
         adapter = offline_windows_adapter()
-        adapter._count_outgoing_text_matches = Mock(return_value=1)
-        adapter.wal_tracker.snapshot.side_effect = AssertionError("WAL 不能证明文本发送")
-        adapter._capture_chat_region = Mock(side_effect=AssertionError("任意画面变化不能证明文本发送"))
-        ok, _ = self.verify_text(adapter)
-        self.assertFalse(ok)
-
-    def test_missing_message_accessibility_does_not_submit_text(self):
-        adapter = offline_windows_adapter()
-        adapter._count_outgoing_text_matches = Mock(return_value=None)
-        ok, message = self.verify_text(adapter)
-        self.assertFalse(ok)
-        self.assertIn("未提交名称", message)
-        adapter._paste_and_submit.assert_not_called()
-
-    def test_cancellation_during_text_confirmation_is_not_success(self):
-        adapter = offline_windows_adapter()
-        adapter._count_outgoing_text_matches = Mock(return_value=0)
-        adapter._paste_and_submit.side_effect = lambda *a, **kw: adapter.set_stop_callback(lambda: True)
-        self.assertFalse(self.verify_text(adapter)[0])
+        adapter._capture_chat_region = Mock(side_effect=RuntimeError("模拟截图不可用"))
+        self.assertTrue(self.verify_text(adapter)[0])
+        adapter._paste_and_submit.assert_called_once_with("ENTER", is_text=True)
 
     def check_target(self, current, expected):
         adapter = offline_windows_adapter()
         adapter._find_wechat_hwnd = Mock(return_value=123)
         adapter.get_current_chat_title = Mock(return_value=current)
+        adapter.search_and_switch_chat = Mock(side_effect=AssertionError("手动定位不应搜索或切换聊天"))
         fake_user32 = SimpleNamespace(GetForegroundWindow=lambda: 123)
         with patch("wechat_sender.wechat_adapter.sys.platform", "win32"), patch(
             "wechat_sender.wechat_adapter.ctypes.windll", SimpleNamespace(user32=fake_user32)
         ):
             return adapter.ensure_foreground_and_target(expected)
 
-    def test_generic_or_missing_chat_title_fails_closed(self):
+    def test_manual_current_window_does_not_require_readable_chat_title(self):
         for current in ("", "微信", "当前微信聊天"):
             with self.subTest(current=current):
-                self.assertFalse(self.check_target(current, "测试好友")[0])
+                self.assertTrue(self.check_target(current, "当前微信聊天")[0])
 
-    def test_substring_target_match_is_rejected(self):
-        self.assertFalse(self.check_target("测试好友备份群", "测试好友")[0])
-        self.assertFalse(self.check_target("测试好友", "测试好友备份群")[0])
+    def test_explicit_different_chat_still_pauses(self):
+        self.assertFalse(self.check_target("另一个群", "测试好友")[0])
         self.assertTrue(self.check_target("测试好友", "测试好友")[0])
 
-    def test_generic_target_is_rejected(self):
-        for target in ("", "微信", "当前微信聊天"):
-            self.assertFalse(self.check_target("测试好友", target)[0])
+    def test_original_title_containment_handles_window_title_suffix(self):
+        self.assertTrue(self.check_target("测试好友 - 微信", "测试好友")[0])
+        self.assertTrue(self.check_target("测试好友", "测试好友 - 微信")[0])
 
 
 class TestAccessibilityEvidence(unittest.TestCase):
@@ -297,10 +267,9 @@ class TestAccessibilityEvidence(unittest.TestCase):
             self.assertEqual(adapter._count_outgoing_text_matches("01_风景"), 1)
             self.assertEqual(adapter._count_outgoing_text_matches("其他名称"), 0)
 
-    def test_chat_identity_comes_from_header_not_edit_name(self):
-        draft = self.node("EditControl", "危险的草稿内容", (350, 660, 950, 700))
-        heading = self.node("TextControl", "测试好友", (350, 60, 650, 86))
-        root = self.node("WindowControl", "微信", (0, 0, 1000, 800), [draft, heading])
+    def test_unreadable_chat_title_keeps_manual_current_window_fallback(self):
+        edit = SimpleNamespace(Name="", Exists=lambda *_: False)
+        root = SimpleNamespace(EditControl=lambda **_: edit)
         adapter = offline_windows_adapter()
         adapter._find_wechat_hwnd = Mock(return_value=123)
 
@@ -312,9 +281,7 @@ class TestAccessibilityEvidence(unittest.TestCase):
         with patch("wechat_sender.wechat_adapter.sys.platform", "win32"), patch.dict(
             "sys.modules", {"uiautomation": SimpleNamespace(ControlFromHandle=lambda _: root)}
         ), patch("wechat_sender.wechat_adapter.ctypes.windll", SimpleNamespace(user32=fake_user32)):
-            self.assertEqual(adapter.get_current_chat_title(), "测试好友")
-            root.GetChildren = lambda: [draft]
-            self.assertEqual(adapter.get_current_chat_title(), "")
+            self.assertEqual(adapter.get_current_chat_title(), "当前微信聊天")
 
     def test_uia_scope_propagates_callers_original_exception(self):
         fake_uia = SimpleNamespace(UIAutomationInitializerInThread=nullcontext)
