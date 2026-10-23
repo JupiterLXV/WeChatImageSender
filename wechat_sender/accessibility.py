@@ -16,7 +16,9 @@ from typing import Optional
 SPI_GETSCREENREADER = 0x0046
 SPI_SETSCREENREADER = 0x0047
 WM_GETOBJECT = 0x003D
-OBJID_CLIENT = 0xFFFFFFFC
+# Win32 OBJID_CLIENT = (LONG)0xFFFFFFFC = -4（使用有符号 -4 避免 64 位 Python ctypes 32位 c_int 溢出报错）
+OBJID_CLIENT = -4
+SMTO_ABORTIFHUNG = 0x0002
 
 
 @dataclass
@@ -42,11 +44,14 @@ class ZeroPatchAccessibilityActivator:
     def get_screen_reader_flag() -> bool:
         if sys.platform != "win32":
             return False
-        flag = ctypes.c_int(0)
-        ctypes.windll.user32.SystemParametersInfoW(
-            SPI_GETSCREENREADER, 0, ctypes.byref(flag), 0
-        )
-        return bool(flag.value)
+        try:
+            flag = ctypes.c_int(0)
+            ctypes.windll.user32.SystemParametersInfoW(
+                SPI_GETSCREENREADER, 0, ctypes.byref(flag), 0
+            )
+            return bool(flag.value)
+        except Exception:
+            return False
 
     def activate(self, hwnd: Optional[int] = None) -> AccessibilityState:
         os.environ["QT_ACCESSIBILITY"] = "1"
@@ -61,26 +66,47 @@ class ZeroPatchAccessibilityActivator:
             return self._state
 
         prev = self.get_screen_reader_flag()
-        if not prev:
-            # fWinIni=0 避免全局广播 WM_SETTINGCHANGE 造成其他无响应窗口阻塞
-            ctypes.windll.user32.SystemParametersInfoW(
-                SPI_SETSCREENREADER, 1, None, 0
-            )
+        original_flag = self._state.previously_enabled if self._state is not None else prev
+        changed_by_helper = bool(self._state and self._state.activated_by_helper) or not prev
+        try:
+            if not prev:
+                # fWinIni=0 避免全局广播 WM_SETTINGCHANGE 造成其他无响应窗口阻塞
+                ctypes.windll.user32.SystemParametersInfoW(
+                    SPI_SETSCREENREADER, 1, None, 0
+                )
+        except Exception:
+            pass
 
         if hwnd:
-            ctypes.windll.user32.SendMessageTimeoutW(
-                hwnd,
-                WM_GETOBJECT,
-                0,
-                OBJID_CLIENT,
-                0x0002,  # SMTO_ABORTIFHUNG
-                500,
-                None,
-            )
+            try:
+                from ctypes import wintypes
+                user32 = ctypes.windll.user32
+                lresult = ctypes.c_ssize_t(0)
+                user32.SendMessageTimeoutW.argtypes = [
+                    wintypes.HWND,
+                    wintypes.UINT,
+                    wintypes.WPARAM,
+                    wintypes.LPARAM,
+                    wintypes.UINT,
+                    wintypes.UINT,
+                    ctypes.POINTER(ctypes.c_ssize_t),
+                ]
+                user32.SendMessageTimeoutW.restype = wintypes.LPARAM
+                user32.SendMessageTimeoutW(
+                    wintypes.HWND(int(hwnd)),
+                    WM_GETOBJECT,
+                    0,
+                    OBJID_CLIENT,
+                    SMTO_ABORTIFHUNG,
+                    300,
+                    ctypes.byref(lresult),
+                )
+            except Exception:
+                pass
 
         self._state = AccessibilityState(
-            previously_enabled=prev,
-            activated_by_helper=not prev,
+            previously_enabled=original_flag,
+            activated_by_helper=changed_by_helper,
             wechat_hwnd=hwnd,
         )
         return self._state
@@ -89,7 +115,10 @@ class ZeroPatchAccessibilityActivator:
         if self._state is None:
             return
         if sys.platform == "win32" and self._state.activated_by_helper and not self._state.previously_enabled:
-            ctypes.windll.user32.SystemParametersInfoW(
-                SPI_SETSCREENREADER, 0, None, 0
-            )
+            try:
+                ctypes.windll.user32.SystemParametersInfoW(
+                    SPI_SETSCREENREADER, 0, None, 0
+                )
+            except Exception:
+                pass
         self._state = None

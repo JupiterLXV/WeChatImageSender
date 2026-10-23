@@ -1,24 +1,42 @@
-# Byte-compiled / optimized / DLL files
+# Python cache and test output
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Virtual environment
+# Local environments
 .venv/
 venv/
 ENV/
+.env
+.env.*
+!.env.example
 
-# PyInstaller build artifacts
+# Build outputs; keep the reviewed PyInstaller specification in source control
 build/
 dist/
+releases/
 *.spec
+!WeChatImageSender.spec
+*.exe
+*.zip
 
-# Diagnostic & local runtime data
+# Local images, sending jobs, logs, diagnostics and QA output
 data/
 logs/
+jobs/
+diagnostics/
 diagnostic*.json
 *.log
+.qa/
+qa/
+.local-qa/
 
-# OS files
+# Editor and OS files
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db
+Desktop.ini

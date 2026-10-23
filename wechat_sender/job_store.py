@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-发送队列状态机与断点续传持久化模块：
+发送队列状态机与断点续传持久化模块（v3.5 Pro 带系统剪贴板无感备份与恢复）：
 严格按照「待发送 -> 图片已提交待核实 -> 图片已确认待发名称 -> 名称已提交待核实 -> 已完成」顺序推进。
-任何阶段不明时保持 PENDING_VERIFY 暂停状态，绝不盲目自动重发。
+任何阶段不明时保持 NEEDS_MANUAL_VERIFY 暂停状态，绝不盲目自动重发。
 """
-
-from __future__ import annotations
 
 import json
 import os
@@ -13,7 +11,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .image_utils import ImageItem, compute_sha256
 from .wechat_adapter import BaseWeChatAdapter
@@ -101,7 +99,7 @@ def get_default_jobs_dir() -> Path:
 class SequentialSendEngine:
     """
     核心顺序发送引擎：
-    支持先写日志后执行操作、SHA-256 发送前复核、F8 停止信号、以及待核实项人工恢复决策。
+    支持先写日志后执行操作、SHA-256 发送前复核、F8 停止信号、剪贴板自动备份还原、以及待核实项人工恢复决策。
     """
 
     def __init__(
@@ -109,12 +107,14 @@ class SequentialSendEngine:
         adapter: BaseWeChatAdapter,
         jobs_dir: Optional[Path] = None,
         on_progress: Optional[Callable[[JobRecordItem, str], None]] = None,
+        restore_clipboard_on_finish: bool = True,
     ) -> None:
         self.adapter = adapter
         self.jobs_dir = Path(jobs_dir) if jobs_dir else get_default_jobs_dir()
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.on_progress = on_progress
         self.stop_requested = False
+        self.restore_clipboard_on_finish = restore_clipboard_on_finish
 
     def create_job(
         self,
@@ -156,6 +156,8 @@ class SequentialSendEngine:
         tmp_path = self.jobs_dir / f"{job.job_id}.json.tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(job.to_dict(), f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         tmp_path.replace(out_path)
         return out_path
 
@@ -201,100 +203,145 @@ class SequentialSendEngine:
         job: JobState,
         verify_timeout_sec: float = 25.0,
         stable_duration_sec: float = 1.5,
+        reset_stop: bool = True,
     ) -> Tuple[bool, str]:
         """
-        顺序执行队列任务：
+        顺序执行队列任务（进入前备份系统剪贴板，退出时自动还原）：
         返回 (是否全部完成, 停止或完成原因说明)。
         """
-        self.stop_requested = False
+        if reset_stop:
+            self.stop_requested = False
 
-        # 若队列中存在尚未处理的 NEEDS_MANUAL_VERIFY 项，拒绝越过它继续发送
         for item in job.items:
+            if item.stage in (ItemStage.IMAGE_SUBMITTED.value, ItemStage.NAME_SUBMITTED.value):
+                phase = "图片" if item.stage == ItemStage.IMAGE_SUBMITTED.value else "名称"
+                item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
+                self._notify(item, f"上次{phase}提交后状态未确认，请先在微信核实是否已发出")
+                self.save_job(job)
             if item.stage == ItemStage.NEEDS_MANUAL_VERIFY.value:
                 return False, f"第 {item.index + 1} 张（{item.display_name}）处于待人工核实状态，请先核实后再继续"
-
-        for item in job.items:
-            if item.stage == ItemStage.COMPLETED.value:
-                continue
-
-            if self.stop_requested:
-                self.save_job(job)
-                return False, "用户已按停止键暂停队列"
-
-            ok_fg, fg_msg = self.adapter.ensure_foreground_and_target(job.target_chat)
-            if not ok_fg:
-                self.save_job(job)
-                return False, fg_msg
-
-            img_path = Path(item.file_path)
-            if not img_path.exists():
+            if item.stage not in {stage.value for stage in ItemStage}:
                 item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
-                self._notify(item, f"源图片文件不存在: {img_path}")
+                self._notify(item, "任务阶段无法识别，请先人工核实")
                 self.save_job(job)
                 return False, item.last_message
 
-            current_sha = compute_sha256(img_path)
-            if current_sha != item.sha256:
-                item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
-                self._notify(item, "发送前发现源图片 SHA-256 发生变化，已暂停以防错发")
-                self.save_job(job)
-                return False, item.last_message
+        clip_mgr = getattr(self.adapter, "clipboard", None)
+        saved_clipboard = None
+        active_item: Optional[JobRecordItem] = None
+        previous_stop_callback = self.adapter.stop_callback
+        self.adapter.set_stop_callback(lambda: self.stop_requested)
 
-            # 阶段 1：如果尚未确认图片发送成功，则发送图片并等待视觉确认
-            if item.stage in (ItemStage.PENDING.value, ItemStage.IMAGE_SUBMITTED.value):
-                if item.stage == ItemStage.IMAGE_SUBMITTED.value:
-                    # 上次运行在提交图片后中断，不能自动重发，转为待人工核实
-                    item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
-                    self._notify(item, "上次图片提交后状态未确认，请先在微信核实是否已发出")
+        try:
+            if self.restore_clipboard_on_finish and clip_mgr is not None:
+                saved_clipboard = clip_mgr.snapshot()
+            for item in job.items:
+                if item.stage == ItemStage.COMPLETED.value:
+                    continue
+                active_item = item
+
+                if self.stop_requested:
                     self.save_job(job)
-                    return False, item.last_message
+                    return False, "用户已按停止键 (F8) 暂停队列"
 
-                # 先写入 IMAGE_SUBMITTED 状态再执行粘贴发送
-                item.stage = ItemStage.IMAGE_SUBMITTED.value
-                self._notify(item, f"正在发送图片：{item.relative_name} ({job.clipboard_mode})")
-                self.save_job(job)
-
-                self.adapter.send_image(img_path, job.clipboard_mode, job.send_shortcut)
-
-                status = self.adapter.verify_image_sent(
-                    img_path,
-                    timeout_sec=verify_timeout_sec,
-                    stable_duration_sec=stable_duration_sec,
-                )
-                if not status.matched or status.has_failure_badge or not status.is_upload_complete:
-                    item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
-                    self._notify(item, f"图片状态未确认：{status.reason}")
-                    self.save_job(job)
-                    return False, item.last_message
-
-                item.stage = ItemStage.IMAGE_CONFIRMED.value
-                self._notify(item, f"图片上传已确认完成：{status.reason}")
-                self.save_job(job)
-
-            if self.stop_requested:
-                self.save_job(job)
-                return False, "用户已在图片确认后暂停，下次可仅补发名称"
-
-            # 阶段 2：图片已确认完成，发送图片名称
-            if item.stage == ItemStage.IMAGE_CONFIRMED.value:
                 ok_fg, fg_msg = self.adapter.ensure_foreground_and_target(job.target_chat)
                 if not ok_fg:
                     self.save_job(job)
                     return False, fg_msg
 
-                item.stage = ItemStage.NAME_SUBMITTED.value
-                self._notify(item, f"正在发送名称：{item.display_name}")
-                self.save_job(job)
-
-                ok_txt, txt_msg = self.adapter.send_text_and_verify(item.display_name, job.send_shortcut)
-                if not ok_txt:
+                img_path = Path(item.file_path)
+                if not img_path.exists():
                     item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
-                    self._notify(item, f"名称发送未确认：{txt_msg}")
+                    self._notify(item, f"源图片文件不存在: {img_path}")
                     self.save_job(job)
                     return False, item.last_message
 
-                item.stage = ItemStage.COMPLETED.value
-                self._notify(item, f"已完成：{item.display_name}")
-                self.save_job(job)
+                current_sha = compute_sha256(img_path, fast_sample=True)
+                if current_sha != item.sha256:
+                    # 兼容早期完整 SHA-256 记录
+                    full_sha = compute_sha256(img_path, fast_sample=False)
+                    if full_sha != item.sha256:
+                        item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
+                        self._notify(item, "发送前发现源图片内容发生变化，已暂停以防错发")
+                        self.save_job(job)
+                        return False, item.last_message
 
-        return True, f"全部 {len(job.items)} 张图片及名称已按顺序发送并确认完成！"
+                # 阶段 1：如果尚未确认图片发送成功，则发送图片并等待视觉确认
+                if item.stage in (ItemStage.PENDING.value, ItemStage.IMAGE_SUBMITTED.value):
+                    if item.stage == ItemStage.IMAGE_SUBMITTED.value:
+                        item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
+                        self._notify(item, "上次图片提交后状态未确认，请先在微信核实是否已发出")
+                        self.save_job(job)
+                        return False, item.last_message
+
+                    item.stage = ItemStage.IMAGE_SUBMITTED.value
+                    self._notify(item, f"正在发送图片：{item.relative_name} ({job.clipboard_mode})")
+                    self.save_job(job)
+
+                    self.adapter.send_image(img_path, job.clipboard_mode, job.send_shortcut)
+
+                    status = self.adapter.verify_image_sent(
+                        img_path,
+                        timeout_sec=verify_timeout_sec,
+                        stable_duration_sec=stable_duration_sec,
+                    )
+                    if not status.matched or status.has_failure_badge or not status.is_upload_complete:
+                        item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
+                        self._notify(item, f"图片状态未确认：{status.reason}")
+                        self.save_job(job)
+                        return False, item.last_message
+
+                    item.stage = ItemStage.IMAGE_CONFIRMED.value
+                    self._notify(item, f"图片上传已确认完成：{status.reason}")
+                    self.save_job(job)
+
+                if self.stop_requested:
+                    self.save_job(job)
+                    return False, "用户已在图片确认后暂停，下次可仅补发名称"
+
+                # 阶段 2：图片已确认完成，发送图片名称
+                if item.stage == ItemStage.IMAGE_CONFIRMED.value:
+                    ok_fg, fg_msg = self.adapter.ensure_foreground_and_target(job.target_chat)
+                    if not ok_fg:
+                        self.save_job(job)
+                        return False, fg_msg
+
+                    item.stage = ItemStage.NAME_SUBMITTED.value
+                    self._notify(item, f"正在发送名称：{item.display_name}")
+                    self.save_job(job)
+
+                    ok_txt, txt_msg = self.adapter.send_text_and_verify(item.display_name, job.send_shortcut)
+                    if not ok_txt:
+                        item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
+                        self._notify(item, f"名称发送未确认：{txt_msg}")
+                        self.save_job(job)
+                        return False, item.last_message
+
+                    item.stage = ItemStage.COMPLETED.value
+                    self._notify(item, f"已完成：{item.display_name}")
+                    self.save_job(job)
+
+            return True, f"全部 {len(job.items)} 张图片及名称已按顺序发送并确认完成！"
+        except Exception as exc:
+            message = f"发送发生异常，队列已暂停：{exc}"
+            if active_item is not None:
+                # 已提交的操作可能确实发出，保留人工核实状态，绝不自动重发。
+                if active_item.stage in (ItemStage.IMAGE_SUBMITTED.value, ItemStage.NAME_SUBMITTED.value):
+                    active_item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
+                active_item.last_message = message
+                active_item.updated_at = time.time()
+            self.save_job(job)
+            if active_item is not None and self.on_progress:
+                try:
+                    self.on_progress(active_item, message)
+                except Exception:
+                    pass
+            return False, message
+        finally:
+            self.adapter.set_stop_callback(previous_stop_callback)
+            if saved_clipboard is not None and clip_mgr is not None:
+                try:
+                    clip_mgr.restore(saved_clipboard)
+                except Exception:
+                    # 剪贴板恢复失败不能覆盖已经落盘的发送结果。
+                    pass
