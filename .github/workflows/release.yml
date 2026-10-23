@@ -65,6 +65,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out release notes
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Download verified Windows package
         uses: actions/download-artifact@v4
         with:
@@ -82,6 +87,12 @@ jobs:
             Where-Object { $_.Name -match '\.zip(\.sha256)?$' } |
             Select-Object -ExpandProperty FullName)
           if ($files.Count -lt 2) { throw 'Release package or checksum is missing.' }
-          gh release create $env:RELEASE_TAG @files --verify-tag `
-            --title "WeChatImageSender $env:RELEASE_TAG" --generate-notes
+          $notes = Join-Path 'docs/releases' "$($env:RELEASE_TAG).md"
+          if (Test-Path -LiteralPath $notes -PathType Leaf) {
+            gh release create $env:RELEASE_TAG @files --verify-tag --latest `
+              --title "WeChatImageSender $env:RELEASE_TAG" --notes-file $notes
+          } else {
+            gh release create $env:RELEASE_TAG @files --verify-tag --latest `
+              --title "WeChatImageSender $env:RELEASE_TAG" --generate-notes
+          }
           if ($LASTEXITCODE -ne 0) { throw 'GitHub release creation failed.' }
