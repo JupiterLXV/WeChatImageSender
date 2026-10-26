@@ -425,45 +425,11 @@ def _install_robust_window_detector(adapter: BaseWeChatAdapter) -> None:
                 return False, f"检测到聊天窗口变化（当前：{curr_title}，目标：{exp_clean}），已暂停"
         return True, "OK"
 
-    def _robust_send_text_and_verify(self: WindowsWeChatAdapter, text: str, send_shortcut: str) -> Tuple[bool, str]:
-        try:
-            prev_txt_shot = self._capture_chat_region()
-        except Exception:
-            prev_txt_shot = None
-        pre_txt_wal = self.wal_tracker.snapshot() if hasattr(self, "wal_tracker") else None
-
-        self.clipboard.set_text(text)
-        self._paste_and_submit(send_shortcut, is_text=True)
-
-        send_ts = time.monotonic()
-        deadline = send_ts + 2.5
-        while time.monotonic() < deadline:
-            time.sleep(0.06)
-            if prev_txt_shot is None:
-                return True, f"已发送图片名称：{text}"
-            try:
-                after_text_shot = self._capture_chat_region()
-                if after_text_shot.size == prev_txt_shot.size:
-                    w, h = after_text_shot.size
-                    b1 = np.asarray(prev_txt_shot.convert("L").crop((int(w * 0.15), int(h * 0.35), w, h)), dtype=np.float32)
-                    b2 = np.asarray(after_text_shot.convert("L").crop((int(w * 0.15), int(h * 0.35), w, h)), dtype=np.float32)
-                    abs_d = np.abs(b2 - b1)
-                    if float(np.mean(abs_d)) > 0.20 or int(np.sum(abs_d > 12.0)) >= 80:
-                        return True, f"已确认图片名称“{text}”极速上屏完成"
-                curr_wal = self.wal_tracker.snapshot() if hasattr(self, "wal_tracker") else None
-                if pre_txt_wal is not None and curr_wal is not None and curr_wal != pre_txt_wal:
-                    return True, f"已确认图片名称“{text}”写入完成"
-                if (time.monotonic() - send_ts) >= 0.45:
-                    return True, f"已发送图片名称：{text}"
-            except Exception:
-                return True, f"已发送图片名称：{text}"
-        return True, f"已发送图片名称：{text}"
 
     adapter._find_wechat_hwnd = types.MethodType(_robust_find_wechat_hwnd, adapter)  # type: ignore[method-assign]
     adapter.get_current_chat_title = types.MethodType(_robust_get_current_chat_title, adapter)  # type: ignore[method-assign]
     adapter.activate_chat = types.MethodType(_robust_activate_chat, adapter)  # type: ignore[method-assign]
     adapter.ensure_foreground_and_target = types.MethodType(_robust_ensure_foreground_and_target, adapter)  # type: ignore[method-assign]
-    adapter.send_text_and_verify = types.MethodType(_robust_send_text_and_verify, adapter)  # type: ignore[method-assign]
 
 
 
@@ -486,7 +452,7 @@ class _LegacySenderAppGUI:
         self.theme_name = "light"
         self.colors = THEMES[self.theme_name]
 
-        title_suffix = " [演示模式]" if demo_mode else " v3.6.1"
+        title_suffix = " [演示模式]" if demo_mode else " v3.6.2"
         self.root.title(f"微信图片顺序发送助手{title_suffix}")
         self.root.geometry("1200x810")
         self.root.minsize(1040, 700)
@@ -737,7 +703,7 @@ class _LegacySenderAppGUI:
             pass
         try:
             q_sec = float(self.quiet_sec_var.get())
-            self.adapter.set_quiet_confirm_sec(max(0.10, min(5.0, q_sec)))
+            self.adapter.set_quiet_confirm_sec(max(1.5, min(5.0, q_sec)))
         except Exception:
             pass
         try:

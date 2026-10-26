@@ -42,6 +42,7 @@ class JobRecordItem:
     stage: str = ItemStage.PENDING.value
     last_message: str = ""
     updated_at: float = field(default_factory=time.time)
+    image_confirmation: str = ""
 
 
 @dataclass
@@ -178,12 +179,14 @@ class SequentialSendEngine:
 
         if decision == ManualDecision.SEND_NAME_ONLY:
             item.stage = ItemStage.IMAGE_CONFIRMED.value
+            item.image_confirmation = "manual"
             item.last_message = "人工确认图片已发出，准备仅补发名称"
         elif decision == ManualDecision.MARK_COMPLETED:
             item.stage = ItemStage.COMPLETED.value
             item.last_message = "人工确认图片与名称均已发出，标记完成"
         elif decision == ManualDecision.RETRY_FULL_ITEM:
             item.stage = ItemStage.PENDING.value
+            item.image_confirmation = ""
             item.last_message = "人工确认未发出，重置为待发送"
         else:
             raise ValueError(f"未知的人工决策: {decision}")
@@ -201,7 +204,7 @@ class SequentialSendEngine:
     def run_job(
         self,
         job: JobState,
-        verify_timeout_sec: float = 25.0,
+        verify_timeout_sec: float = 60.0,
         stable_duration_sec: float = 1.5,
         reset_stop: bool = True,
     ) -> Tuple[bool, str]:
@@ -213,6 +216,10 @@ class SequentialSendEngine:
             self.stop_requested = False
 
         for item in job.items:
+            if item.stage == ItemStage.IMAGE_CONFIRMED.value and item.image_confirmation not in ("visual-v2", "manual"):
+                item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
+                self._notify(item, "旧版图片确认记录需要重新核实；未自动补发名称或重发图片")
+                self.save_job(job)
             if item.stage in (ItemStage.IMAGE_SUBMITTED.value, ItemStage.NAME_SUBMITTED.value):
                 phase = "图片" if item.stage == ItemStage.IMAGE_SUBMITTED.value else "名称"
                 item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
@@ -285,13 +292,14 @@ class SequentialSendEngine:
                         timeout_sec=verify_timeout_sec,
                         stable_duration_sec=stable_duration_sec,
                     )
-                    if not status.matched or status.has_failure_badge or not status.is_upload_complete:
+                    if not self.adapter.image_status_allows_name(status):
                         item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
                         self._notify(item, f"图片状态未确认：{status.reason}")
                         self.save_job(job)
                         return False, item.last_message
 
                     item.stage = ItemStage.IMAGE_CONFIRMED.value
+                    item.image_confirmation = "visual-v2"
                     self._notify(item, f"图片上传已确认完成：{status.reason}")
                     self.save_job(job)
 
@@ -305,6 +313,18 @@ class SequentialSendEngine:
                     if not ok_fg:
                         self.save_job(job)
                         return False, fg_msg
+
+                    if item.image_confirmation != "manual":
+                        ready, reason = self.adapter.confirm_image_before_name(img_path)
+                        if not ready:
+                            item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
+                            self._notify(item, reason)
+                            self.save_job(job)
+                            return False, reason
+
+                    if self.stop_requested:
+                        self.save_job(job)
+                        return False, "用户已在发送名称前暂停"
 
                     item.stage = ItemStage.NAME_SUBMITTED.value
                     self._notify(item, f"正在发送名称：{item.display_name}")

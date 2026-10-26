@@ -288,7 +288,7 @@ class VisualBubbleVerifier:
     1. 图像金字塔由粗到细多尺度匹配（0.5x 粗筛 + 全分辨率精配，默认阈值 0.40）；
     2. 超长图/超宽图（h/w > 2.4 或 < 0.42）自动回退中心/顶部正方形裁切子块匹配；
     3. 红色感叹号失败标记一票否决；
-    4. 左侧状态区防边缘渗入静态转圈图标检测（Static Spinner Veto，x - 12 安全边距）；
+    4. 缩略图两侧状态图标检测，支持不同显示缩放；
     5. 连续帧间动态差分静止确认（Spinner Motion Score <= 阈值）。
     """
 
@@ -480,7 +480,18 @@ class VisualBubbleVerifier:
                 340, 310, 280, 260, 240, 225, 210, 195, 180, 168,
                 160, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60,
             ]
-            candidate_widths = [w for w in base_widths if w <= int(cw * 0.82)]
+            # Captures use physical pixels. At 150–300% display scaling a
+            # normal thumbnail can be wider than the old 340-pixel ceiling.
+            # Keep the old small-scale candidates and add a bounded coarse
+            # grid; successful callers still pass one locked width directly.
+            maximum = min(1000, int(cw * 0.75))
+            large_widths = list(range(360, maximum + 1, 30))
+            if maximum > 340:
+                large_widths.append(maximum)
+            candidate_widths = sorted(
+                {w for w in base_widths if w <= int(cw * 0.82)} | set(large_widths),
+                reverse=True,
+            )
             if not candidate_widths:
                 candidate_widths = [max(24, int(cw * 0.45))]
 
@@ -527,76 +538,91 @@ class VisualBubbleVerifier:
         chat_screenshot: Image.Image,
         bbox: Tuple[int, int, int, int],
     ) -> bool:
-        """检测缩略图左侧状态区域是否存在微信红色发送失败感叹号图标。"""
-        x, y, w, h = bbox
-        status_w = max(28, int(w * 0.35))
-        sx1 = max(0, x - status_w - 6)
-        sx2 = max(0, x - 4)
-        if sx2 <= sx1 or h < 24:
-            return False
+        """检测独立的红色失败图标，避免大缩略图稀释小图标像素比例。"""
+        for _side, region_box in self._status_regions(chat_screenshot, bbox):
+            arr = np.asarray(chat_screenshot.convert("RGB").crop(region_box), dtype=np.int16)
+            r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+            red = (r > 155) & ((r - g) > 65) & ((r - b) > 65)
+            if self._compact_status_components(red, bbox, allow_solid=True):
+                return True
+        return False
 
-        region = chat_screenshot.convert("RGB").crop((sx1, y, sx2, y + h))
-        arr = np.asarray(region, dtype=np.float32)
-        r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-        red_mask = (r > 175) & (g < 95) & (b < 95) & ((r - g) > 90)
-        red_ratio = float(np.mean(red_mask))
-        if red_ratio < self.red_failure_ratio_threshold:
-            return False
+    @staticmethod
+    def _status_regions(
+        screenshot: Image.Image, bbox: Tuple[int, int, int, int]
+    ) -> List[Tuple[str, Tuple[int, int, int, int]]]:
+        """Separate UI status areas from the photo and the top-aligned avatar.
 
-        top_slice = red_mask[: max(2, h // 6), :]
-        bottom_slice = red_mask[h - max(2, h // 6) :, :]
-        edge_red_ratio = 0.5 * (float(np.mean(top_slice)) + float(np.mean(bottom_slice)))
-        return edge_red_ratio < 0.50
+        No DPI value is required: the search covers common indicator sizes in
+        physical pixels instead of a fixed 30-pixel column.
+        """
+        x, y, w, h = map(int, bbox)
+        strip = max(64, min(180, int(round(w * 0.65))))
+        gap = max(6, min(12, int(round(w * 0.025))))
+        candidates = [
+            ("left", (x - strip, y, x - gap, y + h)),
+            # The avatar is normally at the top on the other side. A middle
+            # band plus border-component rejection keeps it out of this test.
+            ("right", (x + w + gap, y + int(h * 0.20),
+                       x + w + strip, y + int(h * 0.80))),
+        ]
+        regions = []
+        for side, (x1, y1, x2, y2) in candidates:
+            box = (max(0, x1), max(0, y1), min(screenshot.width, x2), min(screenshot.height, y2))
+            if box[2] - box[0] >= 8 and box[3] - box[1] >= 8:
+                regions.append((side, box))
+        return regions
+
+    @staticmethod
+    def _compact_status_components(
+        mask: np.ndarray, bbox: Tuple[int, int, int, int], allow_solid: bool = False
+    ) -> bool:
+        """Find compact floating indicators; reject photo edges and large UI blocks."""
+        if mask.ndim != 2 or not np.any(mask):
+            return False
+        # Join separated spokes/dots without relying on their rendering scale.
+        joined = cv2.dilate(mask.astype(np.uint8), np.ones((5, 5), dtype=np.uint8))
+        count, _labels, stats, _centers = cv2.connectedComponentsWithStats(joined, connectivity=8)
+        rows, cols = mask.shape
+        maximum = max(40, min(96, int(round(bbox[2] * 0.45))))
+        for index in range(1, count):
+            left, top, width, height, _area = map(int, stats[index])
+            # Dilation expands 2 pixels around an indicator. Border-attached
+            # regions are normally the photo edge, avatar, or window chrome.
+            if left <= 0 or top <= 0 or left + width >= cols or top + height >= rows:
+                continue
+            original = mask[top:top + height, left:left + width]
+            ys, xs = np.where(original)
+            if xs.size < 8:
+                continue
+            actual_w, actual_h = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
+            if not (5 <= actual_w <= maximum and 5 <= actual_h <= maximum):
+                continue
+            if not 0.45 <= actual_w / float(actual_h) <= 2.2:
+                continue
+            density = xs.size / float(actual_w * actual_h)
+            if 0.08 <= density <= (1.0 if allow_solid else 0.85):
+                return True
+        return False
 
     def detect_static_spinner(
         self,
         chat_screenshot: Image.Image,
         bbox: Tuple[int, int, int, int],
     ) -> bool:
+        """Veto a visible indicator even when its animation freezes.
+
+        The photo itself is deliberately excluded: a circular object in the
+        source image is not an upload indicator.
         """
-        单帧静态转圈图标存在性检测（带防缩略图圆角边缘渗入与防背景干扰保护）：
-        - 预留 12px 右侧安全间距（sx2 = x - 12），杜绝缩略图自身左边缘因多尺度定位偏差渗入检测区；
-        - 要求上下背景基准纯净（bg_std <= 8.0），且异常像素必须独立悬浮于状态列中央（不贴靠左右边界）。
-        """
-        x, y, w, h = bbox
-        sx1 = max(0, x - 42)
-        sx2 = max(0, x - 12)
-        if sx2 - sx1 < 12 or h < 32:
-            return False
-
-        col_gray = self._to_gray_array(chat_screenshot.crop((sx1, y, sx2, y + h)))
-        ch_h, ch_w = col_gray.shape
-        band = max(4, ch_h // 4)
-        bg_pixels = np.concatenate([col_gray[:band, :].ravel(), col_gray[ch_h - band :, :].ravel()])
-        bg_median = float(np.median(bg_pixels))
-        bg_std = float(np.std(bg_pixels))
-        if bg_std > 8.0:
-            return False
-
-        cy = ch_h // 2
-        half_win = min(14, max(8, ch_h // 5))
-        mid_region = col_gray[max(band, cy - half_win) : min(ch_h - band, cy + half_win), :]
-        if mid_region.size == 0 or mid_region.shape[1] < 8:
-            return False
-
-        mid_std = float(np.std(mid_region))
-        thresh = max(35.0, 4.0 * bg_std + 25.0)
-        deviant_mask = np.abs(mid_region - bg_median) > thresh
-        deviant_count = int(np.sum(deviant_mask))
-        deviation_ratio = float(np.mean(deviant_mask))
-        edge_dev_ratio = float(np.mean(np.abs(bg_pixels - bg_median) > thresh))
-
-        right_border_ratio = float(np.mean(deviant_mask[:, -2:]))
-        left_border_ratio = float(np.mean(deviant_mask[:, :2]))
-        if right_border_ratio > 0.30 or left_border_ratio > 0.30:
-            return False
-
-        return (
-            mid_std >= 12.0
-            and 18 <= deviant_count <= 260
-            and deviation_ratio >= 0.025
-            and edge_dev_ratio < 0.05
-        )
+        threshold = max(10.0, min(24.0, self.static_spinner_std_threshold * 1.5))
+        for _side, region_box in self._status_regions(chat_screenshot, bbox):
+            gray = self._to_gray_array(chat_screenshot.crop(region_box))
+            background = float(np.median(gray))
+            mask = np.abs(gray - background) >= threshold
+            if self._compact_status_components(mask, bbox):
+                return True
+        return False
 
     def compute_spinner_motion(
         self,
@@ -604,19 +630,116 @@ class VisualBubbleVerifier:
         curr_screenshot: Image.Image,
         bbox: Tuple[int, int, int, int],
     ) -> float:
-        """计算连续两帧在缩略图左侧状态区与缩略图中心的平均绝对像素差分。"""
-        x, y, w, h = bbox
-        status_w = max(28, int(w * 0.35))
-        sx1 = max(0, x - status_w - 6)
-        sx2 = min(curr_screenshot.width, x + w)
-        sy1 = max(0, y)
-        sy2 = min(curr_screenshot.height, y + h)
-
-        crop1 = self._to_gray_array(prev_screenshot.crop((sx1, sy1, sx2, sy2)))
-        crop2 = self._to_gray_array(curr_screenshot.crop((sx1, sy1, sx2, sy2)))
-        if crop1.shape != crop2.shape or crop1.size == 0:
+        """Use local activity so a small animation is not diluted by a large photo."""
+        if prev_screenshot.size != curr_screenshot.size:
             return 999.0
-        return float(np.mean(np.abs(crop1 - crop2)))
+        x, y, w, h = bbox
+        photo_box = (max(0, x), max(0, y), min(curr_screenshot.width, x + w), min(curr_screenshot.height, y + h))
+        regions = [box for _side, box in self._status_regions(curr_screenshot, bbox)] + [photo_box]
+        scores = []
+        for box in regions:
+            if box[2] <= box[0] or box[3] <= box[1]:
+                continue
+            crop1 = self._to_gray_array(prev_screenshot.crop(box))
+            crop2 = self._to_gray_array(curr_screenshot.crop(box))
+            if crop1.shape != crop2.shape or crop1.size == 0:
+                return 999.0
+            diff = np.abs(crop1 - crop2)
+            window = max(8, min(24, int(round(min(w, h) * 0.10))))
+            window = min(window, min(diff.shape))
+            local = cv2.boxFilter(diff, -1, (window, window), normalize=True, borderType=cv2.BORDER_CONSTANT)
+            scores.append(float(np.max(local)))
+        if not scores:
+            return 999.0
+        return max(scores)
+
+    def detect_center_upload_overlay(
+        self, screenshot: Image.Image, source_image: Image.Image,
+        bbox: Tuple[int, int, int, int],
+    ) -> bool:
+        """Veto a new neutral loading ring over an otherwise matching photo.
+
+        This is intentionally narrow. It requires matching surroundings and
+        rejects residuals near edges already present in the source, so a photo
+        of a circle or compression around lettering does not become a spinner.
+        """
+        x, y, width, height = map(int, bbox)
+        if (width < 36 or height < 36 or x < 0 or y < 0
+                or x + width > screenshot.width or y + height > screenshot.height):
+            return False
+        actual = np.asarray(screenshot.convert("RGB").crop((x, y, x + width, y + height)), dtype=np.float32)
+        center_x, center_y = width // 2, height // 2
+        half = min(64, int(min(width, height) * .32))
+        # Sample only the surrounding photo while choosing the display resize
+        # and one-pixel registration. The center must not choose its own fit.
+        step = max(1, min(width, height) // 100)
+        ys, xs = np.mgrid[2:height - 2:step, 2:width - 2:step]
+        outside = ((np.abs(xs - center_x) > half) | (np.abs(ys - center_y) > half))
+        sample_y, sample_x = ys[outside], xs[outside]
+        if sample_x.size < 100:
+            return False
+        best = None
+        source = source_image.convert("RGB")
+        for method in (Image.Resampling.LANCZOS, Image.Resampling.BILINEAR):
+            expected = np.asarray(source.resize((width, height), method), dtype=np.float32)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    delta = actual[sample_y, sample_x] - expected[sample_y + dy, sample_x + dx]
+                    offset = np.median(delta, axis=0)
+                    error = np.abs(delta - offset)
+                    mean = float(np.mean(error))
+                    if best is None or mean < best[0]:
+                        best = (mean, float(np.percentile(error, 95)), offset, expected, dx, dy)
+        mean, percentile, offset, expected, dx, dy = best
+        if mean > 5.0 or percentile > 16.0 or np.max(np.abs(offset)) > 8.0:
+            return False
+        # Use the selected registration only in the interior, where every
+        # source index is valid and photo borders cannot contribute residuals.
+        x1, y1 = center_x - half, center_y - half
+        x2, y2 = center_x + half, center_y + half
+        reference = expected[y1 + dy:y2 + dy, x1 + dx:x2 + dx] + offset
+        patch = actual[y1:y2, x1:x2]
+        residual = np.max(np.abs(patch - reference), axis=2)
+        neutral = np.max(patch, axis=2) - np.min(patch, axis=2) <= 16.0
+        foreground = ((residual >= 36.0) & neutral).astype(np.uint8)
+        if not np.any(foreground):
+            return False
+        reference_gray = np.mean(reference, axis=2)
+        kernel = np.ones((5, 5), dtype=np.uint8)
+        source_edges = cv2.dilate(reference_gray, kernel) - cv2.erode(reference_gray, kernel) > 28.0
+        joined = cv2.dilate(foreground, np.ones((3, 3), dtype=np.uint8))
+        count, _labels, stats, _centers = cv2.connectedComponentsWithStats(joined, connectivity=8)
+        for index in range(1, count):
+            left, top, w, h, _area = map(int, stats[index])
+            if left <= 0 or top <= 0 or left + w >= foreground.shape[1] or top + h >= foreground.shape[0]:
+                continue
+            local = foreground[top:top + h, left:left + w]
+            my, mx = np.where(local)
+            if mx.size < 18:
+                continue
+            ax1, ay1, ax2, ay2 = int(mx.min()), int(my.min()), int(mx.max()), int(my.max())
+            ring_w, ring_h = ax2 - ax1 + 1, ay2 - ay1 + 1
+            if not (7 <= ring_w <= 96 and 7 <= ring_h <= 96 and .70 <= ring_w / ring_h <= 1.40):
+                continue
+            rx, ry = (ax1 + ax2) / 2.0, (ay1 + ay2) / 2.0
+            if abs(left + rx - half) > 6 or abs(top + ry - half) > 6:
+                continue
+            density = mx.size / float(ring_w * ring_h)
+            if not .12 <= density <= .65:
+                continue
+            radial = np.sqrt(((mx - rx) / (ring_w / 2.0)) ** 2 + ((my - ry) / (ring_h / 2.0)) ** 2)
+            if float(np.mean((radial >= .50) & (radial <= 1.35))) < .85:
+                continue
+            angles = np.arctan2(my - ry, mx - rx)
+            sectors = np.floor((angles + np.pi) * 12 / (2 * np.pi)).astype(int) % 12
+            if np.unique(sectors).size < 8:
+                continue
+            # A circle, letter O, or JPEG ringing already in the photograph
+            # has source edges under these pixels. It is not new upload UI.
+            if float(np.mean(source_edges[top + my, left + mx])) > .15:
+                continue
+            return True
+        return False
 
     def evaluate(
         self,
@@ -678,6 +801,12 @@ class VisualBubbleVerifier:
 
         motion = self.compute_spinner_motion(prev_screenshot, curr_screenshot, bbox)
         is_quiet = motion <= self.motion_quiet_threshold
+        if is_quiet and self.detect_center_upload_overlay(curr_screenshot, source_image, bbox):
+            return BubbleVisualStatus(
+                matched=True, similarity=sim, bbox=bbox, has_failure_badge=False,
+                has_static_spinner=True, spinner_motion_score=99.0, is_upload_complete=False,
+                reason="图片中央存在源图没有的上传指示覆盖层，继续等待",
+            )
         return BubbleVisualStatus(
             matched=True,
             similarity=sim,

@@ -10,6 +10,7 @@
 
 import contextlib
 import ctypes
+import math
 import os
 import struct
 import sys
@@ -25,6 +26,7 @@ from PIL import Image, ImageDraw
 
 from .accessibility import ZeroPatchAccessibilityActivator
 from .clipboard_win32 import ClipboardManager
+from .capture_win32 import capture_chat_frame
 from .windows_ocr import normalized_text, recognize as recognize_local_text
 from .image_utils import (
     DEFAULT_SIMILARITY_THRESHOLD,
@@ -33,7 +35,7 @@ from .image_utils import (
     load_static_image,
 )
 
-DEFAULT_QUIET_CONFIRM_SEC = 0.35
+DEFAULT_QUIET_CONFIRM_SEC = 1.5
 
 GENERIC_CHAT_TITLES = {
     "",
@@ -57,8 +59,8 @@ def enable_windows_dpi_awareness() -> None:
         return
     try:
         try:
-            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-            return
+            if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return
         except Exception:
             pass
         res = ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -194,7 +196,18 @@ class BaseWeChatAdapter:
         self.similarity_threshold = threshold
 
     def set_quiet_confirm_sec(self, sec: float) -> None:
-        self.quiet_confirm_sec = max(0.10, min(5.0, sec))
+        self.quiet_confirm_sec = max(1.5, min(5.0, sec))
+
+    def image_status_allows_name(self, status: BubbleVisualStatus) -> bool:
+        threshold = getattr(getattr(self, "verifier", None), "motion_quiet_threshold", 1.8)
+        return (status.matched and status.bbox is not None and status.is_upload_complete
+                and not status.has_failure_badge and not status.has_static_spinner
+                and math.isfinite(status.spinner_motion_score)
+                and status.spinner_motion_score <= threshold)
+
+    def confirm_image_before_name(self, image_path: Path) -> Tuple[bool, str]:
+        """演示适配器无需桌面复查；真实适配器必须覆写。"""
+        return True, "OK"
 
     def set_auto_search_chat(self, enabled: bool) -> None:
         self.auto_search_chat = bool(enabled)
@@ -217,10 +230,8 @@ class BaseWeChatAdapter:
             # 绘制缩略图定位框
             draw.rectangle((bx, by, bx + bw, by + bh), outline=(26, 115, 232), width=3)
             # 绘制左侧状态检测区
-            sx1 = max(0, bx - 42)
-            sx2 = max(0, bx - 12)
-            if sx2 > sx1:
-                draw.rectangle((sx1, by, sx2, by + bh), outline=(245, 175, 45), width=2)
+            for _side, region in VisualBubbleVerifier._status_regions(canvas, self.last_verify_bbox):
+                draw.rectangle(region, outline=(245, 175, 45), width=2)
         return canvas
 
     def diagnose(self) -> WeChatDiagnosticInfo:
@@ -958,90 +969,50 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
             return False
         return bool(self._expected_chat) and self.get_current_chat_title().strip() == self._expected_chat
 
-    @staticmethod
-    def _capture_via_print_window(hwnd: int, w: int, h: int) -> Optional[Image.Image]:
-        """
-        使用 Win32 PrintWindow(PW_RENDERFULLCONTENT=2) 直接读取微信窗口显存缓冲区：
-        即使屏幕右下角弹出系统通知或有置顶悬浮窗，也不会遮挡微信聊天画面。
-        若目标显卡驱动对 Qt/Chromium 返回全黑位图（标准差 < 1.0），自动返回 None 交由 ImageGrab 兜底。
-        """
-        if sys.platform != "win32" or w < 200 or h < 200:
-            return None
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        gdi32 = ctypes.windll.gdi32
-        h_wnd = wintypes.HWND(int(hwnd))
-        wnd_dc = user32.GetWindowDC(h_wnd)
-        if not wnd_dc:
-            return None
-        mem_dc = gdi32.CreateCompatibleDC(wnd_dc)
-        if not mem_dc:
-            user32.ReleaseDC(h_wnd, wnd_dc)
-            return None
-        bmp = gdi32.CreateCompatibleBitmap(wnd_dc, w, h)
-        if not bmp:
-            gdi32.DeleteDC(mem_dc)
-            user32.ReleaseDC(h_wnd, wnd_dc)
-            return None
-        old_obj = gdi32.SelectObject(mem_dc, bmp)
-        try:
-            # PW_RENDERFULLCONTENT = 0x00000002
-            ok = user32.PrintWindow(h_wnd, mem_dc, 2)
-            if not ok:
-                return None
-            bmi = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, 32, 0, w * h * 4, 0, 0, 0, 0)
-            buf = ctypes.create_string_buffer(w * h * 4)
-            lines = gdi32.GetDIBits(mem_dc, bmp, 0, h, buf, bmi, 0)
-            if lines != h:
-                return None
-            img = Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1).convert("RGB")
-            crop = img.crop((int(w * 0.28), int(h * 0.15), w - 6, h - int(h * 0.16)))
-            if float(np.std(np.asarray(crop, dtype=np.float32))) < 1.0:
-                return None
-            return crop
-        except Exception:
-            return None
-        finally:
-            gdi32.SelectObject(mem_dc, old_obj)
-            gdi32.DeleteObject(bmp)
-            gdi32.DeleteDC(mem_dc)
-            user32.ReleaseDC(h_wnd, wnd_dc)
 
     def _capture_chat_region(self) -> Image.Image:
-        from PIL import ImageGrab
-        hwnd = self._find_wechat_hwnd()
-        if hwnd and sys.platform == "win32":
-            from ctypes import wintypes
-            rect = wintypes.RECT()
-            ctypes.windll.user32.GetWindowRect(wintypes.HWND(int(hwnd)), ctypes.byref(rect))
-            w = max(200, rect.right - rect.left)
-            h = max(200, rect.bottom - rect.top)
-            if self.prefer_print_window:
-                pw_img = self._capture_via_print_window(int(hwnd), w, h)
-                if pw_img is not None:
-                    return pw_img
-            box = (
-                rect.left + int(w * 0.28),
-                rect.top + int(h * 0.15),
-                rect.right - 6,
-                rect.bottom - int(h * 0.16),
-            )
-            return ImageGrab.grab(bbox=box, all_screens=True)
-        return ImageGrab.grab(all_screens=True)
+        # A missing window, changed monitor/layout, or backend switch is unknown,
+        # never a reason to compare the whole desktop against an outgoing image.
+        if sys.platform != "win32":
+            raise RuntimeError("当前环境不能读取微信聊天画面")
+        hwnd = getattr(self, "_image_verify_hwnd", None) or getattr(self, "_hwnd", None) or self._find_wechat_hwnd()
+        if not hwnd:
+            raise RuntimeError("未定位到微信窗口，请重新刷新/定位聊天")
+        frame = capture_chat_frame(int(hwnd), prefer_print_window=self.prefer_print_window)
+        signature = getattr(self, "_capture_signature", None)
+        backend = getattr(self, "_capture_backend", None)
+        if signature is not None and signature != frame.signature:
+            raise RuntimeError("微信窗口位置、缩放或输入区布局发生变化，请重新核实当前图片")
+        if backend is not None and backend != frame.backend:
+            raise RuntimeError("截图方式发生变化，当前图片需要重新核实")
+        self._capture_signature = frame.signature
+        self._capture_backend = frame.backend
+        return frame.image
 
-    @staticmethod
-    def _send_keys_win32_fallback(send_shortcut: str, paste_wait: float, enter_wait: float) -> None:
+    def _assert_submission_foreground(self) -> None:
+        hwnd = getattr(self, "_image_verify_hwnd", None) or getattr(self, "_hwnd", None)
+        reader = ctypes.windll.user32.GetForegroundWindow
+        reader.restype = ctypes.c_void_p
+        if not hwnd or int(reader() or 0) != int(hwnd):
+            raise RuntimeError("微信窗口已离开前台，已暂停；请先核实输入框及消息")
+
+    def _send_keys_win32_fallback(self, send_shortcut: str, paste_wait: float, enter_wait: float) -> None:
         user32 = ctypes.windll.user32
         VK_CONTROL = 0x11
         VK_RETURN = 0x0D
         VK_V = 0x56
         KEYEVENTF_KEYUP = 0x0002
 
+        self._assert_submission_foreground()
+        if self._should_stop():
+            raise RuntimeError("用户已暂停，未继续提交消息")
         user32.keybd_event(VK_CONTROL, 0, 0, 0)
         user32.keybd_event(VK_V, 0, 0, 0)
         user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
         user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(paste_wait)
+        if self._wait_or_stop(paste_wait):
+            raise RuntimeError("已暂停；内容可能仍在微信输入框，请先核实")
+        self._assert_submission_foreground()
 
         if send_shortcut.upper() == "CTRL+ENTER":
             user32.keybd_event(VK_CONTROL, 0, 0, 0)
@@ -1055,29 +1026,42 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
 
     def _paste_and_submit(self, send_shortcut: str, is_text: bool = False) -> None:
         if sys.platform != "win32":
-            return
-        paste_wait = 0.05 if is_text else 0.08
-        enter_wait = 0.04 if is_text else 0.06
+            raise RuntimeError("当前环境不能操作微信发送")
+        if self._should_stop():
+            raise RuntimeError("用户已暂停，未继续提交消息")
+        paste_wait = 0.12 if is_text else 0.30
+        enter_wait = 0.08
         try:
-            with _uia_thread_scope():
-                import uiautomation as auto
-                auto.SendKeys("{Ctrl}v", waitTime=paste_wait)
-                time.sleep(paste_wait)
-                if send_shortcut.upper() == "CTRL+ENTER":
-                    auto.SendKeys("{Ctrl}{Enter}", waitTime=enter_wait)
-                else:
-                    auto.SendKeys("{Enter}", waitTime=enter_wait)
-        except Exception:
+            import uiautomation as auto
+        except ImportError:
             self._send_keys_win32_fallback(send_shortcut, paste_wait, enter_wait)
+            return
+        # Once a paste has been attempted, an exception can mean it already took
+        # effect. Never replay the whole operation with another keyboard backend.
+        with _uia_thread_scope():
+            self._assert_submission_foreground()
+            auto.SendKeys("{Ctrl}v", waitTime=paste_wait)
+            if self._wait_or_stop(paste_wait):
+                raise RuntimeError("已暂停；内容可能仍在微信输入框，请先核实")
+            self._assert_submission_foreground()
+            keys = "{Ctrl}{Enter}" if send_shortcut.upper() == "CTRL+ENTER" else "{Enter}"
+            auto.SendKeys(keys, waitTime=enter_wait)
 
     def send_image(self, image_path: Path, clipboard_mode: str, send_shortcut: str) -> None:
-        try:
-            self._pre_send_shot = self._capture_chat_region()
-        except Exception:
-            self._pre_send_shot = None
-        self._pre_send_wal = self.wal_tracker.snapshot()
+        self._capture_signature = None
+        self._capture_backend = None
+        self._last_confirmed_path = None
+        self._last_confirmed_frame = None
         self._last_locked_bbox = None
-
+        self.last_verify_screenshot = None
+        self.last_verify_bbox = None
+        self.last_verify_status = None
+        self._pre_send_shot = None
+        self._image_verify_hwnd = getattr(self, "_hwnd", None) or self._find_wechat_hwnd()
+        # Capture is required before submission, so historical images and draft
+        # previews cannot substitute for evidence of this newly submitted image.
+        self._pre_send_shot = self._capture_chat_region()
+        self._pre_send_wal = None
         if clipboard_mode == "CF_HDROP":
             self.clipboard.set_image_file_hdrop(image_path)
         else:
@@ -1121,124 +1105,122 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         return float(np.mean(difference)) > 2.0 and float(np.mean(difference > 12.0)) > 0.06
 
     def verify_image_sent(
-        self,
-        image_path: Path,
-        timeout_sec: float = 25.0,
+        self, image_path: Path, timeout_sec: float = 60.0,
         stable_duration_sec: float = DEFAULT_QUIET_CONFIRM_SEC,
     ) -> BubbleVisualStatus:
+        self._last_confirmed_path = None
+        self._last_confirmed_frame = None
+        if getattr(self, "_pre_send_shot", None) is None:
+            return self._unconfirmed_status("缺少发送前聊天画面，请人工核实图片")
         src_img, _, _ = load_static_image(image_path)
+        # A pre-existing copy can scroll to a new coordinate when the pending
+        # copy is submitted. Coordinate differences cannot identify which one
+        # finished uploading. Do not automatically name an ambiguous duplicate.
         try:
-            file_mb = image_path.stat().st_size / (1024.0 * 1024.0)
-        except Exception:
-            file_mb = 0.5
-
-        adaptive_timeout = max(timeout_sec, 25.0 + file_mb * 5.0)
-        target_quiet_sec = self.quiet_confirm_sec
-
-        send_start_ts = time.monotonic()
-        deadline = send_start_ts + adaptive_timeout
-        prev_shot: Optional[Image.Image] = None
-        quiet_since: Optional[float] = None
-        locked_widths: Optional[List[int]] = None
-        spinner_seen = False
-
-        last_status = BubbleVisualStatus(
-            matched=False,
-            similarity=0.0,
-            bbox=None,
-            has_failure_badge=False,
-            has_static_spinner=False,
-            spinner_motion_score=999.0,
-            is_upload_complete=False,
-            reason="等待图片上屏...",
-        )
-
+            existed, _, _ = self.verifier.locate_thumbnail(self._pre_send_shot, src_img)
+        except Exception as exc:
+            return self._unconfirmed_status(f"无法核实发送前图片记录：{exc}")
+        if existed:
+            return self._unconfirmed_status("发送前已存在同内容图片，无法区分新旧上传状态；请人工核实本张后继续")
+        file_mb = image_path.stat().st_size / (1024.0 * 1024.0)
+        timeout = max(float(timeout_sec), 30.0 + min(file_mb * 5.0, 270.0))
+        quiet_required = max(1.5, float(stable_duration_sec), float(self.quiet_confirm_sec))
+        started = time.monotonic()
+        deadline = started + timeout
+        previous = None
+        quiet_since = None
+        quiet_frames = 0
+        stable_bbox = None
+        locked_widths = None
+        frame_index = 0
+        status = self._unconfirmed_status("等待新图片上屏及上传指示消失")
         while time.monotonic() < deadline:
-            now = time.monotonic()
-            curr_shot = self._capture_chat_region()
-            self.last_verify_screenshot = curr_shot
-
-            status = self.verifier.evaluate(
-                curr_shot,
-                src_img,
-                prev_shot,
-                candidate_widths=locked_widths,
-            )
-
+            if self._should_stop():
+                return self._unconfirmed_status("用户已暂停图片确认，未发送名称")
+            try:
+                shot = self._capture_chat_region()
+            except Exception as exc:
+                return self._unconfirmed_status(f"无法可靠读取聊天画面：{exc}")
+            self.last_verify_screenshot = shot
+            if shot.info.get("capture_layout") == "fallback":
+                return self._unconfirmed_status("无法可靠区分消息区与输入区，图片已提交，请人工核实后再补发名称")
+            if shot.size != self._pre_send_shot.size:
+                return self._unconfirmed_status("聊天区域尺寸发生变化，请人工核实图片")
+            status = self.verifier.evaluate(shot, src_img, previous, candidate_widths=locked_widths)
             if not status.matched and locked_widths is not None:
                 locked_widths = None
-                status = self.verifier.evaluate(curr_shot, src_img, prev_shot, candidate_widths=None)
-
-            if status.matched and status.bbox is not None and status.has_static_spinner and prev_shot is not None:
-                live_motion = self.verifier.compute_spinner_motion(prev_shot, curr_shot, status.bbox)
-                if live_motion <= self.verifier.motion_quiet_threshold:
-                    status = BubbleVisualStatus(
-                        matched=True,
-                        similarity=status.similarity,
-                        bbox=status.bbox,
-                        has_failure_badge=status.has_failure_badge,
-                        has_static_spinner=False,
-                        spinner_motion_score=live_motion,
-                        is_upload_complete=not status.has_failure_badge,
-                        reason=f"缩略图匹配 ({status.similarity:.2f}) 且状态区画面已静止 (差分 {live_motion:.2f})",
-                    )
-
-            if status.matched and status.bbox is not None:
-                self._last_locked_bbox = status.bbox
-                self.last_verify_bbox = status.bbox
-                locked_widths = [status.bbox[2]]
-
-            if not status.matched and self._pre_send_shot is not None and status.similarity >= max(0.22, self.similarity_threshold * 0.65):
-                diff_bbox = self._detect_new_bubble_bbox(self._pre_send_shot, curr_shot)
-                if diff_bbox is not None and prev_shot is not None:
-                    has_fail = self.verifier.detect_failure_badge(curr_shot, diff_bbox)
-                    has_spin = self.verifier.detect_static_spinner(curr_shot, diff_bbox)
-                    motion = self.verifier.compute_spinner_motion(prev_shot, curr_shot, diff_bbox)
-                    is_quiet = (motion <= self.verifier.motion_quiet_threshold) and (not has_spin) and (not has_fail)
-                    status = BubbleVisualStatus(
-                        matched=True,
-                        similarity=max(status.similarity, self.similarity_threshold),
-                        bbox=diff_bbox,
-                        has_failure_badge=has_fail,
-                        has_static_spinner=has_spin,
-                        spinner_motion_score=motion,
-                        is_upload_complete=is_quiet,
-                        reason=f"帧差确认新增图片气泡 (相似度 {status.similarity:.2f}, 静态转圈={has_spin})",
-                    )
-                    self.last_verify_bbox = diff_bbox
-
-            if status.has_static_spinner or (status.matched and status.spinner_motion_score > self.verifier.motion_quiet_threshold):
-                spinner_seen = True
-
-            if (now - send_start_ts) < self.post_send_grace_sec:
-                status.is_upload_complete = False
-                quiet_since = None
-
-            last_status = status
-            self.last_verify_status = status
+                status = self.verifier.evaluate(shot, src_img, previous, candidate_widths=None)
+            self.last_verify_bbox = status.bbox
+            now = time.monotonic()
             if status.has_failure_badge:
+                status.is_upload_complete = False
+                self.last_verify_status = status
                 return status
-
-            if status.matched and status.is_upload_complete:
-                if quiet_since is None:
-                    quiet_since = now
+            fresh = bool(status.bbox and self._is_new_outgoing_bubble(self._pre_send_shot, shot, status.bbox))
+            ready = self.image_status_allows_name(status) and fresh
+            if ready and now - started >= max(0.75, self.post_send_grace_sec):
+                if quiet_since is None or not self._same_image_bbox(stable_bbox, status.bbox):
+                    quiet_since, quiet_frames = now, 1
+                    stable_bbox = status.bbox
                 else:
-                    elapsed_quiet = now - quiet_since
-                    curr_wal = self.wal_tracker.snapshot()
-                    wal_pulsed = (self._pre_send_wal is not None and curr_wal is not None and curr_wal != self._pre_send_wal)
-                    needed_sec = 0.12 if spinner_seen else (min(0.18, target_quiet_sec) if wal_pulsed else target_quiet_sec)
-                    if elapsed_quiet >= needed_sec:
-                        return status
+                    quiet_frames += 1
+                if quiet_frames >= 4 and now - quiet_since >= quiet_required:
+                    status.reason = f"新图片匹配，转圈消失且连续稳定 {now - quiet_since:.1f} 秒"
+                    self._last_confirmed_path = os.path.normcase(str(image_path.resolve()))
+                    self._last_confirmed_frame = shot
+                    self._last_locked_bbox = status.bbox
+                    self.last_verify_status = status
+                    return status
+                status.reason = f"图片已匹配，等待无转圈连续稳定 {quiet_required:.1f} 秒"
             else:
-                quiet_since = None
+                quiet_since, quiet_frames, stable_bbox = None, 0, None
+                if status.matched and not fresh:
+                    status.reason = "尚未确认是本次新发出的图片，等待或人工核实"
+            # A per-frame classifier result is not yet the sequence-level barrier.
+            status.is_upload_complete = False
+            self.last_verify_status = status
+            previous = shot
+            locked_widths = [status.bbox[2]] if status.matched and status.bbox else None
+            frame_index += 1
+            if self._wait_or_stop(0.12 if frame_index % 2 else 0.16):
+                return self._unconfirmed_status("用户已暂停图片确认，未发送名称")
+        status.is_upload_complete = False
+        status.reason = f"等待图片无转圈并稳定超时 ({timeout:.0f}s)：{status.reason}"
+        self.last_verify_status = status
+        return status
 
-            prev_shot = curr_shot
-            time.sleep(0.06)
+    @staticmethod
+    def _same_image_bbox(first, second) -> bool:
+        if first is None or second is None:
+            return False
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        overlap = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(0, min(ay + ah, by + bh) - max(ay, by))
+        union = aw * ah + bw * bh - overlap
+        return union > 0 and overlap / union >= 0.80
 
-        last_status.is_upload_complete = False
-        last_status.reason = f"等待图片上传完成超时 ({adaptive_timeout:.0f}s): {last_status.reason}"
-        self.last_verify_status = last_status
-        return last_status
+    def confirm_image_before_name(self, image_path: Path) -> Tuple[bool, str]:
+        key = os.path.normcase(str(image_path.resolve()))
+        previous = getattr(self, "_last_confirmed_frame", None)
+        if self._should_stop():
+            return False, "用户已暂停，未发送名称"
+        if getattr(self, "_last_confirmed_path", None) != key or previous is None:
+            return False, "缺少本轮图片确认画面，请先人工核实图片"
+        try:
+            shot = self._capture_chat_region()
+            if shot.info.get("capture_layout") == "fallback":
+                return False, "无法可靠区分消息区与输入区，请人工核实图片后再补发名称"
+            src_img, _, _ = load_static_image(image_path)
+            box = getattr(self, "_last_locked_bbox", None)
+            status = self.verifier.evaluate(shot, src_img, previous, candidate_widths=[box[2]] if box else None)
+        except Exception as exc:
+            return False, f"名称发送前无法复查图片：{exc}"
+        self.last_verify_screenshot, self.last_verify_bbox, self.last_verify_status = shot, status.bbox, status
+        if (self.image_status_allows_name(status) and self._same_image_bbox(box, status.bbox)
+                and self._is_new_outgoing_bubble(self._pre_send_shot, shot, status.bbox)):
+            return True, "名称发送前图片复查通过"
+        self._last_confirmed_path = None
+        return False, f"名称发送前图片仍在变化或转圈：{status.reason}"
 
     def _count_outgoing_text_matches(self, text: str) -> Optional[int]:
         """只计聊天记录内右侧且内容完全一致的文本，排除输入框与搜索结果。"""
@@ -1282,39 +1264,14 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         return self._count_outgoing_text_ocr(text)
 
     def send_text_and_verify(self, text: str, send_shortcut: str) -> Tuple[bool, str]:
-        try:
-            prev_txt_shot = self._capture_chat_region()
-        except Exception:
-            prev_txt_shot = None
-        pre_txt_wal = self.wal_tracker.snapshot()
-
+        if self._should_stop():
+            return False, "用户已暂停，未提交名称"
         self.clipboard.set_text(text)
         self._paste_and_submit(send_shortcut, is_text=True)
-
-        send_ts = time.monotonic()
-        deadline = send_ts + 2.5
-        while time.monotonic() < deadline:
-            time.sleep(0.06)
-            if prev_txt_shot is None:
-                return True, f"已发送图片名称：{text}"
-            try:
-                after_text_shot = self._capture_chat_region()
-                if after_text_shot.size == prev_txt_shot.size:
-                    w, h = after_text_shot.size
-                    b1 = np.asarray(prev_txt_shot.convert("L").crop((int(w * 0.15), int(h * 0.35), w, h)), dtype=np.float32)
-                    b2 = np.asarray(after_text_shot.convert("L").crop((int(w * 0.15), int(h * 0.35), w, h)), dtype=np.float32)
-                    abs_d = np.abs(b2 - b1)
-                    if float(np.mean(abs_d)) > 0.20 or int(np.sum(abs_d > 12.0)) >= 80:
-                        return True, f"已确认图片名称“{text}”极速上屏完成"
-                curr_wal = self.wal_tracker.snapshot()
-                if pre_txt_wal is not None and curr_wal is not None and curr_wal != pre_txt_wal:
-                    return True, f"已确认图片名称“{text}”写入完成"
-                if (time.monotonic() - send_ts) >= 0.45:
-                    return True, f"已发送图片名称：{text}"
-            except Exception:
-                return True, f"已发送图片名称：{text}"
-
-        return True, f"已发送图片名称：{text}"
+        if self._wait_or_stop(0.45):
+            return False, "名称提交后暂停，请人工核实是否已发出"
+        # Keep the original keyboard submission path, without an OCR dependency.
+        return True, f"已提交图片名称：{text}"
 
     def close(self) -> None:
         self.activator.restore()

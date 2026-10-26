@@ -43,7 +43,7 @@ jobs:
       - name: Test and package Windows application
         shell: pwsh
         run: |
-          $version = '3.6.1'
+          $version = '3.6.2'
           if ($env:GITHUB_REF_TYPE -eq 'tag') {
             $version = $env:GITHUB_REF_NAME -replace '^v', ''
           }

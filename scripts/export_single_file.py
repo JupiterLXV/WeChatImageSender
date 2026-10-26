@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = [
     'wechat_sender/image_utils.py', 'wechat_sender/clipboard_win32.py',
-    'wechat_sender/accessibility.py', 'wechat_sender/windows_ocr.py', 'wechat_sender/wechat_adapter.py',
+    'wechat_sender/accessibility.py', 'wechat_sender/windows_ocr.py', 'wechat_sender/capture_win32.py', 'wechat_sender/wechat_adapter.py',
     'wechat_sender/job_store.py', 'wechat_sender/gui_layout.py',
     'wechat_sender/gui_workflow.py', 'wechat_sender/gui.py', 'main.py',
 ]

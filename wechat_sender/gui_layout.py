@@ -135,7 +135,7 @@ class DesktopLayoutMixin:
         self.conn_pill = tk.Label(self.header_frame, text="离线演示" if self.demo_mode else "正在检测微信…", padx=10, pady=5, font=("Microsoft YaHei UI", 9), cursor="hand2")
         self.conn_pill.grid(row=0, column=2, rowspan=2, padx=(10, 0))
         self.conn_pill.bind("<Button-1>", lambda _e: self.refresh_chats())
-        self.version_badge = tk.Label(self.header_frame, text="3.6.1", font=("Segoe UI", 8), padx=5)
+        self.version_badge = tk.Label(self.header_frame, text="3.6.2", font=("Segoe UI", 8), padx=5)
         self.version_badge.grid(row=0, column=3, rowspan=2, padx=(10, 0))
         self._load_brand_icon()
 
@@ -180,7 +180,7 @@ class DesktopLayoutMixin:
         self.auto_search_var = tk.BooleanVar(value=False)
         self.print_win_var = tk.BooleanVar(value=False)
         self.threshold_var = tk.DoubleVar(value=0.40)
-        self.quiet_sec_var = tk.DoubleVar(value=0.35)
+        self.quiet_sec_var = tk.DoubleVar(value=1.5)
         self.hud_enable_var = tk.BooleanVar(value=True)
         self.filter_stage_var = tk.StringVar(value="ALL")
         self.search_query_var = tk.StringVar()
@@ -442,7 +442,7 @@ class DesktopLayoutMixin:
             ttk.Radiobutton(keys, text=text, value=value, variable=self.shortcut_var, style="Card.TRadiobutton").pack(side="left", padx=(0, 12))
         ttk.Separator(frame).grid(row=5, column=0, columnspan=2, sticky="ew", pady=14)
         ttk.Label(frame, text="状态确认", style="CardTitle.TLabel").grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        for row, text, var, lo, hi, step in [(7, "图片相似度", self.threshold_var, .1, .9, .05), (8, "稳定确认时间（秒）", self.quiet_sec_var, .15, 3.0, .05)]:
+        for row, text, var, lo, hi, step in [(7, "图片相似度", self.threshold_var, .1, .9, .05), (8, "稳定确认时间（秒）", self.quiet_sec_var, 1.5, 5.0, .25)]:
             ttk.Label(frame, text=text, style="CardBody.TLabel").grid(row=row, column=0, sticky="w", pady=6)
             spin = ttk.Spinbox(frame, textvariable=var, from_=lo, to=hi, increment=step, width=10, command=self._on_params_change)
             spin.grid(row=row, column=1, sticky="e", padx=(20, 0))

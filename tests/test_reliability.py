@@ -162,6 +162,7 @@ class TestOriginalImageFlow(unittest.TestCase):
 
     def test_failure_badge_stops_image_confirmation(self):
         adapter = offline_windows_adapter()
+        adapter._pre_send_shot = self.blank
         adapter._capture_chat_region = Mock(return_value=self.chat)
         adapter.verifier.evaluate = Mock(return_value=BubbleVisualStatus(
             matched=True, similarity=0.95, bbox=(300, 200, 160, 128),
@@ -182,14 +183,15 @@ class TestOriginalImageFlow(unittest.TestCase):
                 adapter._paste_and_submit.assert_called_once_with("CTRL+ENTER", is_text=False)
                 self.assertIs(adapter._pre_send_shot, self.blank)
 
-    def test_optional_initial_capture_failure_does_not_block_submission(self):
+    def test_initial_capture_failure_blocks_submission(self):
         adapter = offline_windows_adapter()
         adapter.clipboard = Mock()
         adapter._capture_chat_region = Mock(side_effect=RuntimeError("模拟截图不可用"))
-        adapter.send_image(self.path, "CF_DIB", "ENTER")
+        with self.assertRaisesRegex(RuntimeError, "模拟截图不可用"):
+            adapter.send_image(self.path, "CF_DIB", "ENTER")
         self.assertIsNone(adapter._pre_send_shot)
-        adapter.clipboard.set_image_dib.assert_called_once_with(self.path)
-        adapter._paste_and_submit.assert_called_once_with("ENTER", is_text=False)
+        adapter.clipboard.set_image_dib.assert_not_called()
+        adapter._paste_and_submit.assert_not_called()
 
 
 class TestOriginalTextFlowAndManualTarget(unittest.TestCase):
