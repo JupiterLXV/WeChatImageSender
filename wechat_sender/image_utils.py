@@ -10,6 +10,7 @@
 
 import hashlib
 import io
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -356,6 +357,7 @@ class VisualBubbleVerifier:
         search_x_start: int,
         src_rgb_img: Image.Image,
         candidate_widths: List[int],
+        collect_matches: Optional[List[Tuple[float, Tuple[int, int, int, int]]]] = None,
     ) -> Tuple[float, Optional[Tuple[int, int, int, int]]]:
         """
         对单个候选源图像执行由粗到细（Coarse-to-Fine Pyramid）多尺度匹配：
@@ -430,29 +432,32 @@ class VisualBubbleVerifier:
 
             tpl_inner_rgb = cv2.resize(src_inner_arr, (iw, ih), interpolation=cv2.INTER_AREA)
             res = cv2.matchTemplate(roi_rgb, tpl_inner_rgb, cv2.TM_SQDIFF_NORMED)
-            _, _, min_loc, _ = cv2.minMaxLoc(res)
-            ix, iy = int(min_loc[0]), int(min_loc[1])
-
-            patch_inner = roi_rgb[iy : iy + ih, ix : ix + iw]
-            if patch_inner.shape[0] != ih or patch_inner.shape[1] != iw:
-                continue
-
-            score = self._perceptual_patch_similarity(patch_inner, tpl_inner_rgb)
-
-            full_x = search_x_start + max(0, ix - pad_x)
-            full_y = max(0, iy - pad_y)
-            full_w = min(tw, cw - full_x)
-            full_h = min(th, ch - full_y)
-
-            if full_w >= 24 and full_h >= 24:
-                tpl_full_rgb = cv2.resize(src_full_arr, (full_w, full_h), interpolation=cv2.INTER_AREA)
-                patch_full = chat_arr[full_y : full_y + full_h, full_x : full_x + full_w]
-                full_score = self._perceptual_patch_similarity(patch_full, tpl_full_rgb)
-                score = max(score, full_score)
-
-            if score > best_score + 0.002:
-                best_score = score
-                best_bbox = (full_x, full_y, full_w, full_h)
+            # A global minimum alone always chooses an older exact copy when
+            # the newest copy contains an upload overlay. Inspect distinct
+            # response peaks so the caller can follow the latest message.
+            for _ in range(8 if collect_matches is not None else 1):
+                min_value, _, min_loc, _ = cv2.minMaxLoc(res)
+                if not math.isfinite(min_value) or min_value > 1.0:
+                    break
+                ix, iy = int(min_loc[0]), int(min_loc[1])
+                patch_inner = roi_rgb[iy : iy + ih, ix : ix + iw]
+                score = self._perceptual_patch_similarity(patch_inner, tpl_inner_rgb)
+                full_x = search_x_start + max(0, ix - pad_x)
+                full_y = max(0, iy - pad_y)
+                full_w = min(tw, cw - full_x)
+                full_h = min(th, ch - full_y)
+                if full_w >= 24 and full_h >= 24:
+                    tpl_full_rgb = cv2.resize(src_full_arr, (full_w, full_h), interpolation=cv2.INTER_AREA)
+                    patch_full = chat_arr[full_y : full_y + full_h, full_x : full_x + full_w]
+                    score = max(score, self._perceptual_patch_similarity(patch_full, tpl_full_rgb))
+                bbox = (full_x, full_y, full_w, full_h)
+                if score > best_score + 0.002:
+                    best_score, best_bbox = score, bbox
+                if collect_matches is not None:
+                    collect_matches.append((score, bbox))
+                # Suppress neighboring placements of this same thumbnail.
+                res[max(0, iy - ih // 2):iy + ih // 2 + 1,
+                    max(0, ix - iw // 2):ix + iw // 2 + 1] = 2.0
 
         return best_score, best_bbox
 
@@ -461,6 +466,7 @@ class VisualBubbleVerifier:
         chat_screenshot: Image.Image,
         source_image: Image.Image,
         candidate_widths: Optional[List[int]] = None,
+        prefer_latest: bool = False,
     ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
         """
         多尺度金字塔定位 + 超长图/超宽图自适应裁切子块匹配：
@@ -468,6 +474,7 @@ class VisualBubbleVerifier:
         - 当原图为超长图（h/w > 2.4，如手机长截图）或超宽全景图（w/h > 2.4）时，
           微信聊天气泡会对原图进行居中或顶部正方形/4:3 裁切显示，算法会自动提取中心与顶部子块进行二次匹配。
         """
+        self.last_match_candidates = []
         chat_rgb_img = chat_screenshot.convert("RGB")
         src_rgb_img = source_image.convert("RGB")
         cw, ch = chat_rgb_img.size
@@ -499,13 +506,16 @@ class VisualBubbleVerifier:
         search_x_start = max(0, int(cw * 0.15))
         roi_rgb = chat_arr[:, search_x_start:]
 
+        candidates = [] if prefer_latest else None
         best_score, best_bbox = self._match_single_source_template(
-            chat_arr, roi_rgb, search_x_start, src_rgb_img, candidate_widths
+            chat_arr, roi_rgb, search_x_start, src_rgb_img, candidate_widths, collect_matches=candidates
         )
 
         # 超长图 / 超宽图裁切子块匹配兜底（Extreme Aspect Ratio Sub-Crop Matching）
         aspect = sh / float(sw)
-        if best_score < max(0.72, self.similarity_threshold + 0.15) and (aspect > 2.4 or aspect < 0.42):
+        if (aspect > 2.4 or aspect < 0.42) and (
+            prefer_latest or best_score < max(0.72, self.similarity_threshold + 0.15)
+        ):
             sub_crops: List[Image.Image] = []
             if aspect > 2.4:
                 # 纵向长截图：微信通常居中裁切 1:1 或 1:1.25，或从顶部裁切 1:1
@@ -524,14 +534,37 @@ class VisualBubbleVerifier:
 
             for sub_img in sub_crops:
                 sub_score, sub_bbox = self._match_single_source_template(
-                    chat_arr, roi_rgb, search_x_start, sub_img, candidate_widths
+                    chat_arr, roi_rgb, search_x_start, sub_img, candidate_widths, collect_matches=candidates
                 )
                 if sub_score > best_score + 0.005:
                     best_score = sub_score
                     best_bbox = sub_bbox
 
+        if candidates is not None:
+            distinct = []
+            floor = max(self.similarity_threshold, best_score - 0.10)
+            for score, box in sorted(candidates, key=lambda pair: pair[0], reverse=True):
+                x, y, width, height = box
+                if score < floor or x + width * .5 < cw * .55 or x + width < cw * .75:
+                    continue
+                if any(self._boxes_overlap(box, old) for _, old in distinct):
+                    continue
+                distinct.append((score, box))
+            self.last_match_candidates = distinct
+            if distinct:
+                best_score, best_bbox = max(distinct, key=lambda pair: pair[1][1] + pair[1][3] * .5)
+            else:
+                return False, max(0.0, float(best_score)), None
         matched = best_score >= self.similarity_threshold
         return matched, max(0.0, float(best_score)), best_bbox if matched else None
+
+    @staticmethod
+    def _boxes_overlap(first, second) -> bool:
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        overlap = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(0, min(ay + ah, by + bh) - max(ay, by))
+        union = aw * ah + bw * bh - overlap
+        return union > 0 and overlap / union >= .30
 
     def detect_failure_badge(
         self,
@@ -748,7 +781,7 @@ class VisualBubbleVerifier:
         prev_screenshot: Optional[Image.Image] = None,
         candidate_widths: Optional[List[int]] = None,
     ) -> BubbleVisualStatus:
-        matched, sim, bbox = self.locate_thumbnail(curr_screenshot, source_image, candidate_widths)
+        matched, sim, bbox = self.locate_thumbnail(curr_screenshot, source_image, candidate_widths, prefer_latest=True)
         if not matched or bbox is None:
             return BubbleVisualStatus(
                 matched=False,

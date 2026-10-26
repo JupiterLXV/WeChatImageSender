@@ -25,6 +25,7 @@ py -3 -m venv .venv
 - `capture_win32.py`：带 DPI 处理、窗口校验和布局识别的消息区截图；无法读取窗口时暂停。
 - `windows_ocr.py`：保留的可选文字识别工具；当前默认定位及发送流程不调用 OCR。
 - `image_utils.py`：图片读取、摘要、命名和客户端画面判断。
+- `submission_tracker.py`：使用历史候选、画面对齐与本轮上传变化识别新增图片；历史同图本身不阻止继续。
 - `clipboard_win32.py`、`accessibility.py`：Windows 平台支持。
 
 修改 Logo 时同时检查 `assets/app-icon.png`、小尺寸 PNG、ICO，以及窗口、任务栏和 PyInstaller 资源。`docs/images/desktop.png` 必须使用离线人工样张，不得包含真实微信信息。
@@ -58,7 +59,7 @@ py -3 -m venv .venv
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-构建使用 `WeChatImageSender.spec`，默认发行产物输出到 `releases/3.6.2/`。仅复制 `.exe` 可能缺少运行依赖，应完整交付输出目录或压缩包。以当前构建脚本及 CI 日志确认产物，不把本地构建成功描述成 GitHub Release 已发布。
+构建使用 `WeChatImageSender.spec`，默认发行产物输出到 `releases/3.6.3/`。仅复制 `.exe` 可能缺少运行依赖，应完整交付输出目录或压缩包。以当前构建脚本及 CI 日志确认产物，不把本地构建成功描述成 GitHub Release 已发布。
 
 根目录 `WeChatImageSender_v3.py` 是转到 `main.py` 的兼容启动入口，需要项目其他模块。需要独立脚本时执行：
 

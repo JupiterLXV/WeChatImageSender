@@ -27,6 +27,7 @@ from PIL import Image, ImageDraw
 from .accessibility import ZeroPatchAccessibilityActivator
 from .clipboard_win32 import ClipboardManager
 from .capture_win32 import capture_chat_frame
+from .submission_tracker import ImageSubmissionTracker
 from .windows_ocr import normalized_text, recognize as recognize_local_text
 from .image_utils import (
     DEFAULT_SIMILARITY_THRESHOLD,
@@ -1052,6 +1053,7 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         self._capture_backend = None
         self._last_confirmed_path = None
         self._last_confirmed_frame = None
+        self._submission_tracker = None
         self._last_locked_bbox = None
         self.last_verify_screenshot = None
         self.last_verify_bbox = None
@@ -1113,15 +1115,19 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         if getattr(self, "_pre_send_shot", None) is None:
             return self._unconfirmed_status("缺少发送前聊天画面，请人工核实图片")
         src_img, _, _ = load_static_image(image_path)
-        # A pre-existing copy can scroll to a new coordinate when the pending
-        # copy is submitted. Coordinate differences cannot identify which one
-        # finished uploading. Do not automatically name an ambiguous duplicate.
+        # Historical copies are context, not a reason to reject a new upload.
+        # Track the newest candidate and its submission lifecycle separately.
         try:
-            existed, _, _ = self.verifier.locate_thumbnail(self._pre_send_shot, src_img)
+            self.verifier.locate_thumbnail(self._pre_send_shot, src_img, prefer_latest=True)
+            historical = self._candidate_boxes()
+            pre_uploading = [box for box in historical if (
+                self.verifier.detect_static_spinner(self._pre_send_shot, box)
+                or self.verifier.detect_center_upload_overlay(self._pre_send_shot, src_img, box)
+            )]
+            self._submission_tracker = ImageSubmissionTracker(
+                self._pre_send_shot, historical, pre_uploading_boxes=pre_uploading)
         except Exception as exc:
             return self._unconfirmed_status(f"无法核实发送前图片记录：{exc}")
-        if existed:
-            return self._unconfirmed_status("发送前已存在同内容图片，无法区分新旧上传状态；请人工核实本张后继续")
         file_mb = image_path.stat().st_size / (1024.0 * 1024.0)
         timeout = max(float(timeout_sec), 30.0 + min(file_mb * 5.0, 270.0))
         quiet_required = max(1.5, float(stable_duration_sec), float(self.quiet_confirm_sec))
@@ -1156,7 +1162,9 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
                 status.is_upload_complete = False
                 self.last_verify_status = status
                 return status
-            fresh = bool(status.bbox and self._is_new_outgoing_bubble(self._pre_send_shot, shot, status.bbox))
+            fresh, fresh_reason = self._submission_tracker.observe(
+                shot, status.bbox, self._candidate_boxes(status.bbox), uploading=status.has_static_spinner
+            ) if status.bbox else (False, "等待本次新图片出现")
             ready = self.image_status_allows_name(status) and fresh
             if ready and now - started >= max(0.75, self.post_send_grace_sec):
                 if quiet_since is None or not self._same_image_bbox(stable_bbox, status.bbox):
@@ -1175,7 +1183,7 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
             else:
                 quiet_since, quiet_frames, stable_bbox = None, 0, None
                 if status.matched and not fresh:
-                    status.reason = "尚未确认是本次新发出的图片，等待或人工核实"
+                    status.reason = fresh_reason
             # A per-frame classifier result is not yet the sequence-level barrier.
             status.is_upload_complete = False
             self.last_verify_status = status
@@ -1199,6 +1207,11 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         union = aw * ah + bw * bh - overlap
         return union > 0 and overlap / union >= 0.80
 
+    def _candidate_boxes(self, fallback=None):
+        candidates = getattr(self.verifier, "last_match_candidates", ())
+        boxes = [box for _, box in candidates] if isinstance(candidates, (list, tuple)) else []
+        return boxes or ([fallback] if fallback else [])
+
     def confirm_image_before_name(self, image_path: Path) -> Tuple[bool, str]:
         key = os.path.normcase(str(image_path.resolve()))
         previous = getattr(self, "_last_confirmed_frame", None)
@@ -1216,8 +1229,14 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         except Exception as exc:
             return False, f"名称发送前无法复查图片：{exc}"
         self.last_verify_screenshot, self.last_verify_bbox, self.last_verify_status = shot, status.bbox, status
+        tracker = getattr(self, "_submission_tracker", None)
+        if tracker is not None and status.bbox:
+            fresh, _ = tracker.observe(shot, status.bbox, self._candidate_boxes(status.bbox),
+                                       uploading=status.has_static_spinner)
+        else:
+            fresh = bool(status.bbox and self._is_new_outgoing_bubble(self._pre_send_shot, shot, status.bbox))
         if (self.image_status_allows_name(status) and self._same_image_bbox(box, status.bbox)
-                and self._is_new_outgoing_bubble(self._pre_send_shot, shot, status.bbox)):
+                and fresh):
             return True, "名称发送前图片复查通过"
         self._last_confirmed_path = None
         return False, f"名称发送前图片仍在变化或转圈：{status.reason}"

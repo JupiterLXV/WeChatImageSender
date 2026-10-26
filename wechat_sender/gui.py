@@ -452,7 +452,7 @@ class _LegacySenderAppGUI:
         self.theme_name = "light"
         self.colors = THEMES[self.theme_name]
 
-        title_suffix = " [演示模式]" if demo_mode else " v3.6.2"
+        title_suffix = " [演示模式]" if demo_mode else " v3.6.3"
         self.root.title(f"微信图片顺序发送助手{title_suffix}")
         self.root.geometry("1200x810")
         self.root.minsize(1040, 700)
