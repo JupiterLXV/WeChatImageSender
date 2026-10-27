@@ -84,7 +84,6 @@ class SenderWorkflowMixin:
             "_pre_send_shot", "_pre_send_wal", "_last_locked_bbox", "_last_sent_image",
             "_capture_signature", "_capture_backend", "_image_verify_hwnd",
             "_last_confirmed_path", "_last_confirmed_frame",
-            "_submission_tracker",
         ):
             if hasattr(self.adapter, name):
                 setattr(self.adapter, name, None)

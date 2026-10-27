@@ -3,7 +3,7 @@
 import math
 import io
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -39,7 +39,7 @@ class TestUploadIndicators(unittest.TestCase):
 
     def evaluate_at(self, source, current, previous, bbox):
         verifier = VisualBubbleVerifier()
-        verifier.locate_thumbnail = Mock(return_value=(True, .98, bbox))
+        verifier._locate_current_thumbnail = Mock(return_value=(True, .98, bbox))
         return verifier.evaluate(current, source, previous)
 
     def test_frozen_spinner_blocks_at_common_scales_and_both_themes(self):
@@ -160,11 +160,12 @@ class TestUploadIndicators(unittest.TestCase):
     def test_explicit_width_keeps_the_locked_matching_path(self):
         source, scene, bbox, _color = self.make_scene()
         verifier = VisualBubbleVerifier()
-        original = verifier._match_single_source_template
-        verifier._match_single_source_template = Mock(wraps=original)
-        matched, _similarity, _box = verifier.locate_thumbnail(scene, source, candidate_widths=[bbox[2]])
+        from wechat_sender import image_utils
+        with patch.object(image_utils.cv2, "matchTemplate", wraps=image_utils.cv2.matchTemplate) as matching:
+            matched, _similarity, box = verifier.locate_thumbnail(scene, source, candidate_widths=[bbox[2]])
         self.assertTrue(matched)
-        self.assertEqual(verifier._match_single_source_template.call_args.args[-1], [bbox[2]])
+        self.assertEqual(matching.call_count, 1)
+        self.assertEqual(box[2], bbox[2])
 
     def test_frozen_white_and_gray_center_rings_veto_completion(self):
         for color in ((255, 255, 255), (180, 180, 180)):

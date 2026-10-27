@@ -311,3 +311,61 @@ def capture_chat_frame(hwnd: int, prefer_print_window: bool = False) -> ChatFram
         cropped = image.crop(crop)
         cropped.info["capture_layout"] = layout
         return ChatFrame(cropped, signature, backend)
+
+
+def capture_reference_frame(hwnd: int, prefer_print_window: bool = False) -> ChatFrame:
+    """Capture the fixed window-relative area used by the supplied wcs build.
+
+    The crop follows the reference's outer-window coordinates: exclude 28%
+    from the left, 15% from the top, six physical pixels from the right and
+    16% from the bottom. It does not require UIA or input-divider recognition.
+    Window and DPI checks still prevent a missing or changed HWND from being
+    replaced with a screenshot of the entire desktop.
+    """
+    user32, gdi32 = _load_win32()
+    with _physical_coordinates(user32):
+        geometry = _geometry(user32, int(hwnd))
+        left, top, right, bottom = geometry.window
+        width, height = right - left, bottom - top
+        crop = (left + int(width * .28), top + int(height * .15),
+                right - 6, bottom - int(height * .16))
+        expected_size = (crop[2] - crop[0], crop[3] - crop[1])
+        if min(expected_size) <= 0:
+            raise CaptureUnavailableError("微信聊天截图区域无效，已暂停确认。")
+
+        image, backend = None, "screen"
+        if prefer_print_window:
+            client_left, client_top, client_right, client_bottom = geometry.client
+            client_size = (client_right - client_left, client_bottom - client_top)
+            try:
+                printed = _print_client(int(hwnd), client_size, user32, gdi32)
+                # A client-only bitmap cannot contain non-client border
+                # pixels. Use the exact screen crop in that case instead of
+                # padding or moving the reference area.
+                contained = (client_left <= crop[0] < crop[2] <= client_right
+                             and client_top <= crop[1] < crop[3] <= client_bottom)
+                if printed is not None and printed.size == client_size and contained:
+                    image = printed.crop((crop[0] - client_left, crop[1] - client_top,
+                                          crop[2] - client_left, crop[3] - client_top))
+                    if image.size == expected_size:
+                        backend = "printwindow"
+                    else:
+                        image = None
+            except Exception:
+                # PrintWindow is optional; a bounded screen capture remains
+                # usable, and its backend is explicitly reported to callers.
+                image = None
+
+        if image is None:
+            try:
+                image = ImageGrab.grab(bbox=crop, all_screens=True)
+            except Exception as exc:
+                raise CaptureUnavailableError("无法读取微信聊天画面，已暂停确认。") from exc
+        if image.size != expected_size:
+            raise CaptureUnavailableError("微信截图尺寸变化，已暂停确认。")
+        if _geometry(user32, int(hwnd)) != geometry:
+            raise CaptureUnavailableError("捕获期间微信窗口位置或缩放发生变化，已暂停确认。")
+        image = image.convert("RGB")
+        image.info["capture_layout"] = "reference"
+        signature = (int(hwnd), geometry.window, geometry.client, geometry.dpi, crop, "reference")
+        return ChatFrame(image, signature, backend)

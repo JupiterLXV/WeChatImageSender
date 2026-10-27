@@ -2,7 +2,7 @@
 param(
     [switch]$SkipTests,
     [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')]
-    [string]$Version = '3.6.3',
+    [string]$Version = '3.6.4',
     [string]$PythonExe
 )
 

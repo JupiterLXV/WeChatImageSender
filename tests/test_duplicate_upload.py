@@ -94,12 +94,12 @@ class TestDuplicateUpload(unittest.TestCase):
                 self.assertFalse(result.is_upload_complete)
                 self.assertIsNone(adapter._last_confirmed_path)
 
-    def test_scroll_of_history_without_any_added_message_is_not_a_new_upload(self):
+    def test_submitted_matching_image_does_not_require_scroll_identity_proof(self):
         before = self.scene(old_y=250)
         moved = self.scene(old_y=50)
         result, adapter, _ = self.verify(before, lambda t: moved, stop_at=3.5)
-        self.assertFalse(result.is_upload_complete)
-        self.assertIsNone(adapter._last_confirmed_path)
+        self.assertTrue(result.is_upload_complete)
+        self.assertIsNotNone(adapter._last_confirmed_path)
 
     def test_repeated_image_appended_without_scroll_can_complete(self):
         before = self.scene(old_y=50)
@@ -177,19 +177,19 @@ class TestDuplicateUpload(unittest.TestCase):
         self.assertTrue(result.is_upload_complete, result.reason)
         self.assertGreaterEqual(result.bbox[1], 450)
 
-    def test_unchanged_historical_duplicate_is_never_new_evidence(self):
+    def test_submitted_duplicate_may_finish_at_identical_coordinates(self):
         before = self.scene(old_y=470)
         result, adapter, _ = self.verify(before, lambda t: before.copy(), stop_at=3.5)
-        self.assertFalse(result.is_upload_complete)
-        self.assertIsNone(adapter._last_confirmed_path)
+        self.assertTrue(result.is_upload_complete)
+        self.assertIsNotNone(adapter._last_confirmed_path)
 
-    def test_spinner_already_in_history_before_submission_is_not_new_evidence(self):
+    def test_submitted_matching_image_continues_after_visible_spinner_disappears(self):
         before = self.scene(new_y=470, spinner=True)
         old_finished = self.scene(old_y=470)
         result, adapter, _ = self.verify(before, lambda t: before if t < 2.0 else old_finished,
                                          stop_at=4.5)
-        self.assertFalse(result.is_upload_complete)
-        self.assertIsNone(adapter._last_confirmed_path)
+        self.assertTrue(result.is_upload_complete)
+        self.assertIsNotNone(adapter._last_confirmed_path)
 
 
 if __name__ == "__main__":

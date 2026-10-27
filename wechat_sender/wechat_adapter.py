@@ -5,7 +5,7 @@
 2. 【PrintWindow 后台抗遮挡抓图 + ImageGrab 双引擎】支持在通知弹窗遮挡时直接从窗口缓冲区抓取画面；
 3. 【手动定位】用户先打开目标聊天，再由程序刷新当前微信窗口；保留原版可选搜索方式；
 4. 【现场视觉对比快照】保存最新校验截图与定位框（get_annotated_verify_screenshot），供待核实弹窗直观并排展示；
-5. 【原版发送算法】保留图像金字塔、定位框锁定及原名称提交逻辑，不以 OCR 读出名称作为前提。
+5. 【参考版发送算法】采用用户提供 wcs 的多尺度匹配、帧差气泡回退及名称提交流程，不以 OCR 读出名称作为前提。
 """
 
 import contextlib
@@ -26,8 +26,7 @@ from PIL import Image, ImageDraw
 
 from .accessibility import ZeroPatchAccessibilityActivator
 from .clipboard_win32 import ClipboardManager
-from .capture_win32 import capture_chat_frame
-from .submission_tracker import ImageSubmissionTracker
+from .capture_win32 import capture_reference_frame as capture_chat_frame
 from .windows_ocr import normalized_text, recognize as recognize_local_text
 from .image_utils import (
     DEFAULT_SIMILARITY_THRESHOLD,
@@ -1053,15 +1052,13 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         self._capture_backend = None
         self._last_confirmed_path = None
         self._last_confirmed_frame = None
-        self._submission_tracker = None
         self._last_locked_bbox = None
         self.last_verify_screenshot = None
         self.last_verify_bbox = None
         self.last_verify_status = None
         self._pre_send_shot = None
         self._image_verify_hwnd = getattr(self, "_hwnd", None) or self._find_wechat_hwnd()
-        # Capture is required before submission, so historical images and draft
-        # previews cannot substitute for evidence of this newly submitted image.
+        # Retain the reference frame for its optional changed-bubble fallback.
         self._pre_send_shot = self._capture_chat_region()
         self._pre_send_wal = None
         if clipboard_mode == "CF_HDROP":
@@ -1090,44 +1087,13 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         bw, bh = max(32, x2 - x1), max(32, y2 - y1)
         return (rx + x1, ry + y1, bw, bh)
 
-    @staticmethod
-    def _is_new_outgoing_bubble(
-        pre_shot: Optional[Image.Image], curr_shot: Image.Image, bbox: Tuple[int, int, int, int]
-    ) -> bool:
-        if pre_shot is None or pre_shot.size != curr_shot.size:
-            return False
-        x, y, bw, bh = bbox
-        width, _ = curr_shot.size
-        if x + bw * 0.5 < width * 0.55 or x + bw < width * 0.75:
-            return False
-        box = (x, y, x + bw, y + bh)
-        before = np.asarray(pre_shot.convert("RGB").crop(box), dtype=np.float32)
-        after = np.asarray(curr_shot.convert("RGB").crop(box), dtype=np.float32)
-        difference = np.abs(after - before)
-        return float(np.mean(difference)) > 2.0 and float(np.mean(difference > 12.0)) > 0.06
-
     def verify_image_sent(
         self, image_path: Path, timeout_sec: float = 60.0,
         stable_duration_sec: float = DEFAULT_QUIET_CONFIRM_SEC,
     ) -> BubbleVisualStatus:
         self._last_confirmed_path = None
         self._last_confirmed_frame = None
-        if getattr(self, "_pre_send_shot", None) is None:
-            return self._unconfirmed_status("缺少发送前聊天画面，请人工核实图片")
         src_img, _, _ = load_static_image(image_path)
-        # Historical copies are context, not a reason to reject a new upload.
-        # Track the newest candidate and its submission lifecycle separately.
-        try:
-            self.verifier.locate_thumbnail(self._pre_send_shot, src_img, prefer_latest=True)
-            historical = self._candidate_boxes()
-            pre_uploading = [box for box in historical if (
-                self.verifier.detect_static_spinner(self._pre_send_shot, box)
-                or self.verifier.detect_center_upload_overlay(self._pre_send_shot, src_img, box)
-            )]
-            self._submission_tracker = ImageSubmissionTracker(
-                self._pre_send_shot, historical, pre_uploading_boxes=pre_uploading)
-        except Exception as exc:
-            return self._unconfirmed_status(f"无法核实发送前图片记录：{exc}")
         file_mb = image_path.stat().st_size / (1024.0 * 1024.0)
         timeout = max(float(timeout_sec), 30.0 + min(file_mb * 5.0, 270.0))
         quiet_required = max(1.5, float(stable_duration_sec), float(self.quiet_confirm_sec))
@@ -1150,22 +1116,21 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
             self.last_verify_screenshot = shot
             if shot.info.get("capture_layout") == "fallback":
                 return self._unconfirmed_status("无法可靠区分消息区与输入区，图片已提交，请人工核实后再补发名称")
-            if shot.size != self._pre_send_shot.size:
+            if previous is not None and shot.size != previous.size:
                 return self._unconfirmed_status("聊天区域尺寸发生变化，请人工核实图片")
-            status = self.verifier.evaluate(shot, src_img, previous, candidate_widths=locked_widths)
+            status = self._evaluate_upload_status(shot, src_img, previous, candidate_widths=locked_widths)
             if not status.matched and locked_widths is not None:
                 locked_widths = None
-                status = self.verifier.evaluate(shot, src_img, previous, candidate_widths=None)
+                status = self._evaluate_upload_status(shot, src_img, previous, candidate_widths=None)
             self.last_verify_bbox = status.bbox
             now = time.monotonic()
             if status.has_failure_badge:
                 status.is_upload_complete = False
                 self.last_verify_status = status
                 return status
-            fresh, fresh_reason = self._submission_tracker.observe(
-                shot, status.bbox, self._candidate_boxes(status.bbox), uploading=status.has_static_spinner
-            ) if status.bbox else (False, "等待本次新图片出现")
-            ready = self.image_status_allows_name(status) and fresh
+            # Follow the reference pipeline: current image matching and upload
+            # state decide readiness. History counts/scroll proofs are not a gate.
+            ready = self.image_status_allows_name(status)
             if ready and now - started >= max(0.75, self.post_send_grace_sec):
                 if quiet_since is None or not self._same_image_bbox(stable_bbox, status.bbox):
                     quiet_since, quiet_frames = now, 1
@@ -1173,7 +1138,7 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
                 else:
                     quiet_frames += 1
                 if quiet_frames >= 4 and now - quiet_since >= quiet_required:
-                    status.reason = f"新图片匹配，转圈消失且连续稳定 {now - quiet_since:.1f} 秒"
+                    status.reason = f"图片匹配，转圈消失且连续稳定 {now - quiet_since:.1f} 秒"
                     self._last_confirmed_path = os.path.normcase(str(image_path.resolve()))
                     self._last_confirmed_frame = shot
                     self._last_locked_bbox = status.bbox
@@ -1182,8 +1147,6 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
                 status.reason = f"图片已匹配，等待无转圈连续稳定 {quiet_required:.1f} 秒"
             else:
                 quiet_since, quiet_frames, stable_bbox = None, 0, None
-                if status.matched and not fresh:
-                    status.reason = fresh_reason
             # A per-frame classifier result is not yet the sequence-level barrier.
             status.is_upload_complete = False
             self.last_verify_status = status
@@ -1207,10 +1170,29 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         union = aw * ah + bw * bh - overlap
         return union > 0 and overlap / union >= 0.80
 
-    def _candidate_boxes(self, fallback=None):
-        candidates = getattr(self.verifier, "last_match_candidates", ())
-        boxes = [box for _, box in candidates] if isinstance(candidates, (list, tuple)) else []
-        return boxes or ([fallback] if fallback else [])
+    def _evaluate_upload_status(self, shot, source, previous, candidate_widths=None):
+        """Reference template matching with its changed-bubble fallback.
+
+        Unlike the old fast path, a static upload indicator is never cleared
+        because its animation froze, and filesystem writes cannot approve it.
+        """
+        status = self.verifier.evaluate(shot, source, previous, candidate_widths=candidate_widths)
+        before = getattr(self, "_pre_send_shot", None)
+        if (not status.matched and before is not None and previous is not None
+                and status.similarity >= max(.22, self.similarity_threshold * .65)):
+            box = self._detect_new_bubble_bbox(before, shot)
+            if box is not None:
+                failed = self.verifier.detect_failure_badge(shot, box)
+                spinner = self.verifier.detect_static_spinner(shot, box)
+                motion = self.verifier.compute_spinner_motion(previous, shot, box)
+                status = BubbleVisualStatus(
+                    matched=True, similarity=max(status.similarity, self.similarity_threshold), bbox=box,
+                    has_failure_badge=failed, has_static_spinner=spinner, spinner_motion_score=motion,
+                    is_upload_complete=(not failed and not spinner and math.isfinite(motion)
+                                        and motion <= self.verifier.motion_quiet_threshold),
+                    reason=f"参考版帧差气泡匹配 (相似度 {status.similarity:.2f}, 转圈={spinner})",
+                )
+        return status
 
     def confirm_image_before_name(self, image_path: Path) -> Tuple[bool, str]:
         key = os.path.normcase(str(image_path.resolve()))
@@ -1225,18 +1207,11 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
                 return False, "无法可靠区分消息区与输入区，请人工核实图片后再补发名称"
             src_img, _, _ = load_static_image(image_path)
             box = getattr(self, "_last_locked_bbox", None)
-            status = self.verifier.evaluate(shot, src_img, previous, candidate_widths=[box[2]] if box else None)
+            status = self._evaluate_upload_status(shot, src_img, previous, candidate_widths=[box[2]] if box else None)
         except Exception as exc:
             return False, f"名称发送前无法复查图片：{exc}"
         self.last_verify_screenshot, self.last_verify_bbox, self.last_verify_status = shot, status.bbox, status
-        tracker = getattr(self, "_submission_tracker", None)
-        if tracker is not None and status.bbox:
-            fresh, _ = tracker.observe(shot, status.bbox, self._candidate_boxes(status.bbox),
-                                       uploading=status.has_static_spinner)
-        else:
-            fresh = bool(status.bbox and self._is_new_outgoing_bubble(self._pre_send_shot, shot, status.bbox))
-        if (self.image_status_allows_name(status) and self._same_image_bbox(box, status.bbox)
-                and fresh):
+        if self.image_status_allows_name(status) and self._same_image_bbox(box, status.bbox):
             return True, "名称发送前图片复查通过"
         self._last_confirmed_path = None
         return False, f"名称发送前图片仍在变化或转圈：{status.reason}"

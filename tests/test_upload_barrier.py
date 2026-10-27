@@ -133,11 +133,11 @@ class TestUploadCompletionBarrier(unittest.TestCase):
         self.assertTrue(result.is_upload_complete)
         self.assertGreaterEqual(clock.now, 0.75 + 2.5)
 
-    def test_historical_matching_image_does_not_confirm_a_new_submission(self):
+    def test_submitted_matching_image_is_not_blocked_by_identical_history(self):
         adapter = mocked_windows_adapter(self.chat.copy(), self.chat)
         result, _ = self.verify(adapter)
-        self.assertFalse(result.is_upload_complete)
-        self.assertIsNone(adapter._last_confirmed_path)
+        self.assertTrue(result.is_upload_complete)
+        self.assertIsNotNone(adapter._last_confirmed_path)
 
     def test_scrolled_historical_duplicate_is_not_the_loading_new_image(self):
         source = Image.open(self.path).convert("RGB")
@@ -155,8 +155,18 @@ class TestUploadCompletionBarrier(unittest.TestCase):
         self.assertFalse(result.is_upload_complete)
         self.assertIsNone(adapter._last_confirmed_path)
 
-    def test_weak_template_match_is_not_promoted_by_frame_changes(self):
+    def test_reference_frame_diff_recovers_weak_match_after_real_frame_change(self):
         adapter = mocked_windows_adapter(self.blank, self.chat)
+        adapter.verifier.evaluate.side_effect = lambda *a, **kw: frame_status(matched=False, complete=True)
+        adapter.verifier.detect_failure_badge.return_value = False
+        adapter.verifier.detect_static_spinner.return_value = False
+        adapter.verifier.compute_spinner_motion.return_value = 0.0
+        result, _ = self.verify(adapter)
+        self.assertTrue(result.matched)
+        self.assertTrue(result.is_upload_complete)
+
+    def test_weak_template_match_without_frame_change_stays_unconfirmed(self):
+        adapter = mocked_windows_adapter(self.chat.copy(), self.chat)
         adapter.verifier.evaluate.side_effect = lambda *a, **kw: frame_status(matched=False, complete=True)
         result, _ = self.verify(adapter)
         self.assertFalse(result.matched)

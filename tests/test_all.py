@@ -172,8 +172,8 @@ class TestVisualBubbleVerifier(unittest.TestCase):
         self.assertTrue(status.is_upload_complete)
         self.assertGreater(status.similarity, 0.90)
 
-    def test_extreme_aspect_ratio_long_image_center_crop_match(self) -> None:
-        """测试超长截图 (h/w = 4.0) 被微信居中裁切为正方形气泡时的子块自适应识别。"""
+    def test_reference_matcher_tolerates_a_long_image_center_crop(self) -> None:
+        """参考版全框/内框匹配在裁切样张上仍达到配置阈值。"""
         verifier = VisualBubbleVerifier()
         src_long = self._create_gradient_source(200, 800)
 
@@ -185,7 +185,7 @@ class TestVisualBubbleVerifier(unittest.TestCase):
         status = verifier.evaluate(chat, src_long, prev_screenshot=chat)
         self.assertTrue(status.matched)
         self.assertTrue(status.is_upload_complete)
-        self.assertGreater(status.similarity, 0.80)
+        self.assertGreaterEqual(status.similarity, verifier.similarity_threshold)
 
     def test_rounded_corners_and_nonstandard_scale_match(self) -> None:
         """测试微信真实气泡具有圆角遮罩、边框及非标缩放宽度 (如 153px) 时的鲁棒高分匹配且不误报转圈。"""
