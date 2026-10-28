@@ -5,6 +5,7 @@
 任何阶段不明时保持 NEEDS_MANUAL_VERIFY 暂停状态，绝不盲目自动重发。
 """
 
+import contextlib
 import json
 import os
 import time
@@ -14,7 +15,8 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .image_utils import ImageItem, compute_sha256
-from .wechat_adapter import BaseWeChatAdapter
+from .wechat_adapter import BaseWeChatAdapter, MessagePreparationError
+from .performance import ItemPerformanceTrace, PerformanceRecorder
 
 
 class ItemStage(str, Enum):
@@ -116,6 +118,66 @@ class SequentialSendEngine:
         self.on_progress = on_progress
         self.stop_requested = False
         self.restore_clipboard_on_finish = restore_clipboard_on_finish
+        self.performance = PerformanceRecorder(self.jobs_dir.parent / "performance")
+        self.last_performance_log: Optional[Path] = None
+        self._active_trace = None
+        self._counter_start = {}
+
+    def _measure(self, stage):
+        return self._active_trace.measure(stage) if self._active_trace is not None else contextlib.nullcontext()
+
+    def _read_performance_counters(self):
+        values = getattr(getattr(self.adapter, "verifier", None), "performance_counters", {})
+        return dict(values) if isinstance(values, dict) else {}
+
+    def _start_performance(self, item):
+        self._active_trace = None
+        self._counter_start = {}
+        self.adapter.performance_trace = None
+        try:
+            trace = ItemPerformanceTrace(item.index)
+            counters = self._read_performance_counters()
+            self._active_trace = trace
+            self._counter_start = counters
+            self.adapter.performance_trace = trace
+        except Exception:
+            self._active_trace = None
+
+    def _submit_with_preparation_retry(self, submit):
+        # The adapter raises this type only before any paste/send keys. Never
+        # retry arbitrary UIA exceptions or unknown submission outcomes.
+        for attempt in range(2):
+            try:
+                return submit()
+            except MessagePreparationError as exc:
+                if not exc.retryable or attempt == 1:
+                    raise
+                if self._active_trace is not None:
+                    try:
+                        self._active_trace.add_counters({"prepare_retries":
+                            self._active_trace.counters.get("prepare_retries", 0) + 1})
+                    except Exception:
+                        pass
+                if self.adapter._wait_or_stop(.25):
+                    raise MessagePreparationError("用户已暂停，尚未提交消息") from exc
+
+    def _finish_performance(self, item):
+        trace = self._active_trace
+        if trace is None:
+            return
+        try:
+            counters = self._read_performance_counters()
+            trace.add_counters({key: max(0, value - self._counter_start.get(key, 0))
+                                for key, value in counters.items()
+                                if isinstance(value, (int, float))})
+            path = self.performance.finish(trace, item.stage)
+            if path is not None:
+                self.last_performance_log = path
+        except Exception:
+            pass
+        finally:
+            self._active_trace = None
+            self.adapter.performance_trace = None
 
     def create_job(
         self,
@@ -155,11 +217,12 @@ class SequentialSendEngine:
     def save_job(self, job: JobState) -> Path:
         out_path = self.jobs_dir / f"{job.job_id}.json"
         tmp_path = self.jobs_dir / f"{job.job_id}.json.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(job.to_dict(), f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp_path.replace(out_path)
+        with self._measure("save_state"):
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(job.to_dict(), f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(out_path)
         return out_path
 
     def load_job(self, job_file: Path) -> JobState:
@@ -214,6 +277,7 @@ class SequentialSendEngine:
         """
         if reset_stop:
             self.stop_requested = False
+        self.last_performance_log = None
 
         for item in job.items:
             if item.stage == ItemStage.IMAGE_CONFIRMED.value and item.image_confirmation not in ("visual-v2", "manual"):
@@ -237,6 +301,7 @@ class SequentialSendEngine:
         saved_clipboard = None
         active_item: Optional[JobRecordItem] = None
         previous_stop_callback = self.adapter.stop_callback
+        previous_performance_trace = getattr(self.adapter, "performance_trace", None)
         self.adapter.set_stop_callback(lambda: self.stop_requested)
 
         try:
@@ -246,12 +311,14 @@ class SequentialSendEngine:
                 if item.stage == ItemStage.COMPLETED.value:
                     continue
                 active_item = item
+                self._start_performance(item)
 
                 if self.stop_requested:
                     self.save_job(job)
                     return False, "用户已按停止键 (F8) 暂停队列"
 
-                ok_fg, fg_msg = self.adapter.ensure_foreground_and_target(job.target_chat)
+                with self._measure("locate_chat"):
+                    ok_fg, fg_msg = self.adapter.ensure_foreground_and_target(job.target_chat)
                 if not ok_fg:
                     self.save_job(job)
                     return False, fg_msg
@@ -263,10 +330,12 @@ class SequentialSendEngine:
                     self.save_job(job)
                     return False, item.last_message
 
-                current_sha = compute_sha256(img_path, fast_sample=True)
+                with self._measure("source_check"):
+                    current_sha = compute_sha256(img_path, fast_sample=True)
                 if current_sha != item.sha256:
                     # 兼容早期完整 SHA-256 记录
-                    full_sha = compute_sha256(img_path, fast_sample=False)
+                    with self._measure("source_check"):
+                        full_sha = compute_sha256(img_path, fast_sample=False)
                     if full_sha != item.sha256:
                         item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
                         self._notify(item, "发送前发现源图片内容发生变化，已暂停以防错发")
@@ -285,13 +354,22 @@ class SequentialSendEngine:
                     self._notify(item, f"正在发送图片：{item.relative_name} ({job.clipboard_mode})")
                     self.save_job(job)
 
-                    self.adapter.send_image(img_path, job.clipboard_mode, job.send_shortcut)
+                    try:
+                        with self._measure("image_submit"):
+                            self._submit_with_preparation_retry(
+                                lambda: self.adapter.send_image(img_path, job.clipboard_mode, job.send_shortcut))
+                    except MessagePreparationError as exc:
+                        item.stage = ItemStage.PENDING.value
+                        self._notify(item, f"图片尚未提交，可稍后继续：{exc}")
+                        self.save_job(job)
+                        return False, item.last_message
 
-                    status = self.adapter.verify_image_sent(
-                        img_path,
-                        timeout_sec=verify_timeout_sec,
-                        stable_duration_sec=stable_duration_sec,
-                    )
+                    with self._measure("image_verify"):
+                        status = self.adapter.verify_image_sent(
+                            img_path,
+                            timeout_sec=verify_timeout_sec,
+                            stable_duration_sec=stable_duration_sec,
+                        )
                     if not self.adapter.image_status_allows_name(status):
                         item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
                         self._notify(item, f"图片状态未确认：{status.reason}")
@@ -309,13 +387,15 @@ class SequentialSendEngine:
 
                 # 阶段 2：图片已确认完成，发送图片名称
                 if item.stage == ItemStage.IMAGE_CONFIRMED.value:
-                    ok_fg, fg_msg = self.adapter.ensure_foreground_and_target(job.target_chat)
+                    with self._measure("locate_chat"):
+                        ok_fg, fg_msg = self.adapter.ensure_foreground_and_target(job.target_chat)
                     if not ok_fg:
                         self.save_job(job)
                         return False, fg_msg
 
                     if item.image_confirmation != "manual":
-                        ready, reason = self.adapter.confirm_image_before_name(img_path)
+                        with self._measure("final_image_check"):
+                            ready, reason = self.adapter.confirm_image_before_name(img_path)
                         if not ready:
                             item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
                             self._notify(item, reason)
@@ -330,7 +410,15 @@ class SequentialSendEngine:
                     self._notify(item, f"正在发送名称：{item.display_name}")
                     self.save_job(job)
 
-                    ok_txt, txt_msg = self.adapter.send_text_and_verify(item.display_name, job.send_shortcut)
+                    try:
+                        with self._measure("name_submit"):
+                            ok_txt, txt_msg = self._submit_with_preparation_retry(
+                                lambda: self.adapter.send_text_and_verify(item.display_name, job.send_shortcut))
+                    except MessagePreparationError as exc:
+                        item.stage = ItemStage.IMAGE_CONFIRMED.value
+                        self._notify(item, f"名称尚未提交，可继续仅补发名称：{exc}")
+                        self.save_job(job)
+                        return False, item.last_message
                     if not ok_txt:
                         item.stage = ItemStage.NEEDS_MANUAL_VERIFY.value
                         self._notify(item, f"名称发送未确认：{txt_msg}")
@@ -340,6 +428,7 @@ class SequentialSendEngine:
                     item.stage = ItemStage.COMPLETED.value
                     self._notify(item, f"已完成：{item.display_name}")
                     self.save_job(job)
+                    self._finish_performance(item)
 
             return True, f"全部 {len(job.items)} 张图片及名称已按顺序发送并确认完成！"
         except Exception as exc:
@@ -358,6 +447,9 @@ class SequentialSendEngine:
                     pass
             return False, message
         finally:
+            if active_item is not None:
+                self._finish_performance(active_item)
+            self.adapter.performance_trace = previous_performance_trace
             self.adapter.set_stop_callback(previous_stop_callback)
             if saved_clipboard is not None and clip_mgr is not None:
                 try:

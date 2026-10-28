@@ -135,7 +135,7 @@ class DesktopLayoutMixin:
         self.conn_pill = tk.Label(self.header_frame, text="离线演示" if self.demo_mode else "正在检测微信…", padx=10, pady=5, font=("Microsoft YaHei UI", 9), cursor="hand2")
         self.conn_pill.grid(row=0, column=2, rowspan=2, padx=(10, 0))
         self.conn_pill.bind("<Button-1>", lambda _e: self.refresh_chats())
-        self.version_badge = tk.Label(self.header_frame, text="3.6.4", font=("Segoe UI", 8), padx=5)
+        self.version_badge = tk.Label(self.header_frame, text="3.6.5", font=("Segoe UI", 8), padx=5)
         self.version_badge.grid(row=0, column=3, rowspan=2, padx=(10, 0))
         self._load_brand_icon()
 

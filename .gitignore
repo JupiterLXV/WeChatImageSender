@@ -26,6 +26,7 @@ dist/
 # Local images, sending jobs, logs, diagnostics and QA output
 data/
 logs/
+performance/
 jobs/
 diagnostics/
 diagnostic*.json

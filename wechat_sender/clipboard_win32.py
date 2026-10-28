@@ -19,6 +19,11 @@ from PIL import Image
 
 from .image_utils import image_to_dib_bytes, load_static_image
 
+
+class ClipboardBusyError(RuntimeError):
+    """The clipboard could not be opened; no paste or send was attempted."""
+
+
 CF_TEXT = 1
 CF_DIB = 8
 CF_UNICODETEXT = 13
@@ -98,7 +103,7 @@ class ClipboardManager:
         user32.SetClipboardData.restype = ctypes.c_void_p
 
         if not self._open_clipboard_with_retry():
-            raise RuntimeError("无法打开系统剪贴板，可能正被其他程序占用")
+            raise ClipboardBusyError("无法打开系统剪贴板，可能正被其他程序占用")
         try:
             user32.EmptyClipboard()
             h_mem = kernel32.GlobalAlloc(GHND, len(raw_bytes))

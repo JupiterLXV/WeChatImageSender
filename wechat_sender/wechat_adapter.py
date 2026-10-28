@@ -25,7 +25,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from .accessibility import ZeroPatchAccessibilityActivator
-from .clipboard_win32 import ClipboardManager
+from .clipboard_win32 import ClipboardBusyError, ClipboardManager
 from .capture_win32 import capture_reference_frame as capture_chat_frame
 from .windows_ocr import normalized_text, recognize as recognize_local_text
 from .image_utils import (
@@ -36,6 +36,13 @@ from .image_utils import (
 )
 
 DEFAULT_QUIET_CONFIRM_SEC = 1.5
+
+
+class MessagePreparationError(RuntimeError):
+    """A failure before any paste/send key; only transient preparation can retry."""
+    def __init__(self, message: str, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = bool(retryable)
 
 GENERIC_CHAT_TITLES = {
     "",
@@ -171,6 +178,36 @@ class BaseWeChatAdapter:
         self.last_verify_status: Optional[BubbleVisualStatus] = None
         self.clipboard: ClipboardManager = ClipboardManager(dry_run=True)
         self.stop_callback: Optional[Callable[[], bool]] = None
+        self.performance_trace = None
+
+    def _measure(self, stage):
+        trace = getattr(self, "performance_trace", None)
+        return trace.measure(stage) if trace is not None else contextlib.nullcontext()
+
+    @contextlib.contextmanager
+    def _prepared_image(self, source):
+        begin = getattr(self.verifier, "begin_image", None)
+        end = getattr(self.verifier, "end_image", None)
+        prepared = False
+        try:
+            if callable(begin):
+                with self._measure("prepare_templates"):
+                    begin(source)
+                prepared = True
+        except Exception:
+            if callable(end):
+                try:
+                    end()
+                except Exception:
+                    pass
+        try:
+            yield
+        finally:
+            if prepared and callable(end):
+                try:
+                    end()
+                except Exception:
+                    pass
 
     def set_stop_callback(self, callback: Optional[Callable[[], bool]]) -> None:
         """让正在等待发送确认的适配器及时响应队列暂停。"""
@@ -180,6 +217,10 @@ class BaseWeChatAdapter:
         return self.stop_callback is not None and bool(self.stop_callback())
 
     def _wait_or_stop(self, seconds: float) -> bool:
+        with self._measure("wait"):
+            return self._wait_or_stop_impl(seconds)
+
+    def _wait_or_stop_impl(self, seconds: float) -> bool:
         deadline = time.monotonic() + max(0.0, seconds)
         while not self._should_stop():
             remaining = deadline - time.monotonic()
@@ -1052,6 +1093,7 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         self._capture_backend = None
         self._last_confirmed_path = None
         self._last_confirmed_frame = None
+        self._last_confirmed_source = None
         self._last_locked_bbox = None
         self.last_verify_screenshot = None
         self.last_verify_bbox = None
@@ -1059,12 +1101,21 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         self._pre_send_shot = None
         self._image_verify_hwnd = getattr(self, "_hwnd", None) or self._find_wechat_hwnd()
         # Retain the reference frame for its optional changed-bubble fallback.
-        self._pre_send_shot = self._capture_chat_region()
+        try:
+            with self._measure("capture"):
+                self._pre_send_shot = self._capture_chat_region()
+        except Exception as exc:
+            raise MessagePreparationError(f"发送前无法读取微信窗口，尚未提交图片：{exc}") from exc
         self._pre_send_wal = None
-        if clipboard_mode == "CF_HDROP":
-            self.clipboard.set_image_file_hdrop(image_path)
-        else:
-            self.clipboard.set_image_dib(image_path)
+        try:
+            with self._measure("clipboard"):
+                if clipboard_mode == "CF_HDROP":
+                    self.clipboard.set_image_file_hdrop(image_path)
+                else:
+                    self.clipboard.set_image_dib(image_path)
+        except Exception as exc:
+            raise MessagePreparationError(f"发送前准备失败，尚未粘贴图片：{exc}",
+                                          retryable=isinstance(exc, ClipboardBusyError)) from exc
         self._paste_and_submit(send_shortcut, is_text=False)
 
     def _detect_new_bubble_bbox(self, pre_shot: Image.Image, curr_shot: Image.Image) -> Optional[Tuple[int, int, int, int]]:
@@ -1093,7 +1144,15 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
     ) -> BubbleVisualStatus:
         self._last_confirmed_path = None
         self._last_confirmed_frame = None
-        src_img, _, _ = load_static_image(image_path)
+        self._last_confirmed_source = None
+        if self._should_stop():
+            return self._unconfirmed_status("用户已暂停图片确认，未发送名称")
+        with self._measure("source_decode"):
+            src_img, _, _ = load_static_image(image_path)
+        with self._prepared_image(src_img):
+            return self._verify_image_loaded(image_path, src_img, timeout_sec, stable_duration_sec)
+
+    def _verify_image_loaded(self, image_path, src_img, timeout_sec, stable_duration_sec):
         file_mb = image_path.stat().st_size / (1024.0 * 1024.0)
         timeout = max(float(timeout_sec), 30.0 + min(file_mb * 5.0, 270.0))
         quiet_required = max(1.5, float(stable_duration_sec), float(self.quiet_confirm_sec))
@@ -1110,7 +1169,8 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
             if self._should_stop():
                 return self._unconfirmed_status("用户已暂停图片确认，未发送名称")
             try:
-                shot = self._capture_chat_region()
+                with self._measure("capture"):
+                    shot = self._capture_chat_region()
             except Exception as exc:
                 return self._unconfirmed_status(f"无法可靠读取聊天画面：{exc}")
             self.last_verify_screenshot = shot
@@ -1141,6 +1201,7 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
                     status.reason = f"图片匹配，转圈消失且连续稳定 {now - quiet_since:.1f} 秒"
                     self._last_confirmed_path = os.path.normcase(str(image_path.resolve()))
                     self._last_confirmed_frame = shot
+                    self._last_confirmed_source = src_img
                     self._last_locked_bbox = status.bbox
                     self.last_verify_status = status
                     return status
@@ -1171,6 +1232,10 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         return union > 0 and overlap / union >= 0.80
 
     def _evaluate_upload_status(self, shot, source, previous, candidate_widths=None):
+        with self._measure("analysis"):
+            return self._evaluate_upload_status_impl(shot, source, previous, candidate_widths)
+
+    def _evaluate_upload_status_impl(self, shot, source, previous, candidate_widths=None):
         """Reference template matching with its changed-bubble fallback.
 
         Unlike the old fast path, a static upload indicator is never cleared
@@ -1202,12 +1267,17 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         if getattr(self, "_last_confirmed_path", None) != key or previous is None:
             return False, "缺少本轮图片确认画面，请先人工核实图片"
         try:
-            shot = self._capture_chat_region()
+            with self._measure("capture"):
+                shot = self._capture_chat_region()
             if shot.info.get("capture_layout") == "fallback":
                 return False, "无法可靠区分消息区与输入区，请人工核实图片后再补发名称"
-            src_img, _, _ = load_static_image(image_path)
+            src_img = getattr(self, "_last_confirmed_source", None)
+            if src_img is None:
+                with self._measure("source_decode"):
+                    src_img, _, _ = load_static_image(image_path)
             box = getattr(self, "_last_locked_bbox", None)
-            status = self._evaluate_upload_status(shot, src_img, previous, candidate_widths=[box[2]] if box else None)
+            with self._prepared_image(src_img):
+                status = self._evaluate_upload_status(shot, src_img, previous, candidate_widths=[box[2]] if box else None)
         except Exception as exc:
             return False, f"名称发送前无法复查图片：{exc}"
         self.last_verify_screenshot, self.last_verify_bbox, self.last_verify_status = shot, status.bbox, status
@@ -1260,11 +1330,17 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
     def send_text_and_verify(self, text: str, send_shortcut: str) -> Tuple[bool, str]:
         if self._should_stop():
             return False, "用户已暂停，未提交名称"
-        self.clipboard.set_text(text)
+        try:
+            with self._measure("clipboard"):
+                self.clipboard.set_text(text)
+        except Exception as exc:
+            raise MessagePreparationError(f"名称尚未粘贴，准备失败：{exc}",
+                                          retryable=isinstance(exc, ClipboardBusyError)) from exc
         self._paste_and_submit(send_shortcut, is_text=True)
         if self._wait_or_stop(0.45):
             return False, "名称提交后暂停，请人工核实是否已发出"
         # Keep the original keyboard submission path, without an OCR dependency.
+        self._last_confirmed_source = None
         return True, f"已提交图片名称：{text}"
 
     def close(self) -> None:

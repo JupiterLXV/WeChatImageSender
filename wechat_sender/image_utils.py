@@ -12,6 +12,7 @@ import hashlib
 import io
 import os
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -284,9 +285,9 @@ class BubbleVisualStatus:
 
 class VisualBubbleVerifier:
     """
-    多信号联合非侵入式视觉验证器（v3.5 Pro）：
-    1. 图像金字塔由粗到细多尺度匹配（0.5x 粗筛 + 全分辨率精配，默认阈值 0.40）；
-    2. 超长图/超宽图（h/w > 2.4 或 < 0.42）自动回退中心/顶部正方形裁切子块匹配；
+    多信号联合非侵入式视觉验证器：
+    1. 保留 wcs 的多尺度内框/全框匹配与默认阈值 0.40；
+    2. 缓存当前源图模板，画面其余部分不变时只在已定位图片附近匹配；
     3. 红色感叹号失败标记一票否决；
     4. 缩略图两侧状态图标检测，支持不同显示缩放；
     5. 连续帧间动态差分静止确认（Spinner Motion Score <= 阈值）。
@@ -298,11 +299,141 @@ class VisualBubbleVerifier:
         motion_quiet_threshold: float = 1.8,
         red_failure_ratio_threshold: float = 0.04,
         static_spinner_std_threshold: float = 8.5,
+        max_cv_threads: int = 2,
     ) -> None:
         self.similarity_threshold = similarity_threshold
         self.motion_quiet_threshold = motion_quiet_threshold
         self.red_failure_ratio_threshold = red_failure_ratio_threshold
         self.static_spinner_std_threshold = static_spinner_std_threshold
+        # Keep native matching from monopolizing every CPU core while WeChat
+        # and Tk must render/respond. Tests/benchmarks may explicitly vary it.
+        if max_cv_threads > 0 and cv2.getNumThreads() > max_cv_threads:
+            cv2.setNumThreads(max_cv_threads)
+        self.performance_counters = {name: 0 for name in (
+            "cache_hits", "cache_misses", "full_searches", "local_searches",
+            "template_resizes", "template_cache_hits", "source_cache_hits",
+            "source_cache_misses",
+        )}
+        self._source_key = None
+        self._source_arrays = None
+        self._source_scope = None
+        self._prepared_source_ref = None
+        self._templates = OrderedDict()
+        self._template_bytes = 0
+        self._location_cache = None
+
+    def begin_image(self, source):
+        """Prepare one immutable source for an adapter's current image step.
+
+        The caller must not mutate it before ``end_image``. Direct public
+        ``locate_thumbnail`` calls still validate content on every call.
+        """
+        self._prepare_source(source)
+        self._prepared_source_ref = source
+
+    def end_image(self):
+        """Release the caller's source image; resized-template storage is bounded."""
+        self._prepared_source_ref = None
+
+    def _prepare_source(self, source, allow_prepared=False):
+        # Full content hashing detects in-place PIL edits as well as a new
+        # object. No id-only cache can mistake a different image after GC.
+        if allow_prepared and self._prepared_source_ref is source and self._source_key is not None:
+            self.performance_counters["source_cache_hits"] += 1
+            return self._source_key
+        # Palette edits change displayed pixels without changing indexed pixel
+        # bytes. Include the palette rather than trusting object identity.
+        palette = (source.palette.mode, source.palette.tobytes()) if source.mode == "P" and source.palette else None
+        key = (source.mode, source.size, hashlib.sha256(source.tobytes()).digest(), palette)
+        if key != self._source_key:
+            self._source_key = key
+            self._source_arrays = None
+            self._templates.clear()
+            self._template_bytes = 0
+            self._location_cache = None
+            self.performance_counters["source_cache_misses"] += 1
+        else:
+            self.performance_counters["source_cache_hits"] += 1
+        return key
+
+    def _prepared_arrays(self, source):
+        if self._source_arrays is not None:
+            return self._source_arrays
+        rgb = source.convert("RGB")
+        sw, sh = rgb.size
+        mx, my = int(round(sw * .10)), int(round(sh * .10))
+        use_inner = sw - 2 * mx >= 16 and sh - 2 * my >= 16
+        inner = rgb.crop((mx, my, sw - mx, sh - my)) if use_inner else rgb
+        arrays = (np.asarray(rgb, dtype=np.uint8), np.asarray(inner, dtype=np.uint8), use_inner)
+        # At most one small/medium source and 16 MiB of resized templates are
+        # retained. Large source arrays live only for the current evaluation.
+        if arrays[0].nbytes + arrays[1].nbytes <= 16 * 1024 * 1024:
+            self._source_arrays = arrays
+        return arrays
+
+    def _template(self, array, width, height, inner):
+        key = (bool(inner), int(width), int(height))
+        cached = self._templates.get(key)
+        if cached is not None:
+            self._templates.move_to_end(key)
+            self.performance_counters["template_cache_hits"] += 1
+            return cached
+        value = cv2.resize(array, (width, height), interpolation=cv2.INTER_AREA)
+        self.performance_counters["template_resizes"] += 1
+        limit = 16 * 1024 * 1024
+        while self._templates and (self._template_bytes + value.nbytes > limit or len(self._templates) >= 64):
+            _, retired = self._templates.popitem(last=False)
+            self._template_bytes -= retired.nbytes
+        if value.nbytes <= limit:
+            self._templates[key] = value
+            self._template_bytes += value.nbytes
+        return value
+
+    def _stable_frame_key(self, screenshot, box):
+        pixels = np.array(screenshot.convert("RGB"), dtype=np.uint8)
+        for _, (x1, y1, x2, y2) in self._status_regions(screenshot, box):
+            pixels[y1:y2, x1:x2] = 0
+        x, y, width, height = box
+        # A central upload overlay may animate. It is checked on every frame
+        # by the normal motion and overlay detectors, never cached as quiet.
+        half = max(12, min(48, int(min(width, height) * .25)))
+        cx, cy = x + width // 2, y + height // 2
+        pixels[max(0, cy-half):cy+half+1, max(0, cx-half):cx+half+1] = 0
+        return (screenshot.size, hashlib.sha256(pixels.tobytes()).digest())
+
+    def _locate_nearby(self, screenshot, source, box):
+        x, y, width, height = box
+        sw, sh = source.size
+        mx, my = int(round(sw * .10)), int(round(sh * .10))
+        use_inner = sw - 2*mx >= 16 and sh - 2*my >= 16
+        margin = max(4, min(24, int(width * .10)))
+        left = max(int(screenshot.width * .15), x - margin)
+        top = max(0, y - margin)
+        right, bottom = min(screenshot.width, x + width + margin), min(screenshot.height, y + height + margin)
+        chat = np.asarray(screenshot.convert("RGB"), dtype=np.uint8)
+        roi = chat[top:bottom, left:right]
+        iw = max(16, int(round(width * .80))) if use_inner else width
+        ih = max(16, int(round(height * .80))) if use_inner else height
+        if iw >= roi.shape[1] or ih >= roi.shape[0]:
+            return False, 0.0, None
+        # Large sources need no RGB conversion or array allocation once their
+        # two small locked-size templates already exist.
+        if (True, iw, ih) in self._templates and (False, width, height) in self._templates:
+            full = inner = None
+        else:
+            full, inner, _ = self._prepared_arrays(source)
+        template = self._template(inner, iw, ih, True)
+        response = cv2.matchTemplate(roi, template, cv2.TM_SQDIFF_NORMED)
+        _, _, position, _ = cv2.minMaxLoc(response)
+        ix, iy = position
+        score = self._perceptual_patch_similarity(roi[iy:iy+ih, ix:ix+iw], template)
+        bx = left + ix - (width - iw) // 2
+        by = top + iy - (height - ih) // 2
+        if bx < 0 or by < 0 or bx + width > screenshot.width or by + height > screenshot.height:
+            return False, score, None
+        full_template = self._template(full, width, height, False)
+        score = max(score, self._perceptual_patch_similarity(chat[by:by+height, bx:bx+width], full_template))
+        return score >= self.similarity_threshold, score, (bx, by, width, height)
 
     @staticmethod
     def _to_gray_array(img: Image.Image) -> np.ndarray:
@@ -355,10 +486,11 @@ class VisualBubbleVerifier:
         source_image: Image.Image,
         candidate_widths: Optional[List[int]] = None,
     ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
+        if self._source_scope is None or self._source_scope[0] is not source_image:
+            self._prepare_source(source_image)
         chat_rgb_img = chat_screenshot.convert("RGB")
-        src_rgb_img = source_image.convert("RGB")
         cw, ch = chat_rgb_img.size
-        sw, sh = src_rgb_img.size
+        sw, sh = source_image.size
         if sw <= 0 or sh <= 0 or cw < 32 or ch < 32:
             return False, 0.0, None
 
@@ -377,17 +509,7 @@ class VisualBubbleVerifier:
         roi_rgb = chat_arr[:, search_x_start:]
         rw = roi_rgb.shape[1]
 
-        margin_x = int(round(sw * 0.10))
-        margin_y = int(round(sh * 0.10))
-        if sw - 2 * margin_x >= 16 and sh - 2 * margin_y >= 16:
-            src_inner_img = src_rgb_img.crop((margin_x, margin_y, sw - margin_x, sh - margin_y))
-            use_inner = True
-        else:
-            src_inner_img = src_rgb_img
-            use_inner = False
-
-        src_inner_arr = np.asarray(src_inner_img, dtype=np.uint8)
-        src_full_arr = np.asarray(src_rgb_img, dtype=np.uint8)
+        src_full_arr, src_inner_arr, use_inner = self._prepared_arrays(source_image)
 
         best_score = -1.0
         best_bbox = None
@@ -409,7 +531,7 @@ class VisualBubbleVerifier:
             if iw >= rw or ih >= ch:
                 continue
 
-            tpl_inner_rgb = cv2.resize(src_inner_arr, (iw, ih), interpolation=cv2.INTER_AREA)
+            tpl_inner_rgb = self._template(src_inner_arr, iw, ih, True)
             res = cv2.matchTemplate(roi_rgb, tpl_inner_rgb, cv2.TM_SQDIFF_NORMED)
             _, _, min_loc, _ = cv2.minMaxLoc(res)
             ix, iy = int(min_loc[0]), int(min_loc[1])
@@ -426,7 +548,7 @@ class VisualBubbleVerifier:
             full_h = min(th, ch - full_y)
 
             if full_w >= 24 and full_h >= 24:
-                tpl_full_rgb = cv2.resize(src_full_arr, (full_w, full_h), interpolation=cv2.INTER_AREA)
+                tpl_full_rgb = self._template(src_full_arr, full_w, full_h, False)
                 patch_full = chat_arr[full_y : full_y + full_h, full_x : full_x + full_w]
                 full_score = self._perceptual_patch_similarity(patch_full, tpl_full_rgb)
                 score = max(score, full_score)
@@ -439,6 +561,32 @@ class VisualBubbleVerifier:
         return matched, max(0.0, float(best_score)), best_bbox if matched else None
 
     def _locate_current_thumbnail(self, screenshot, source, candidate_widths=None):
+        key = self._prepare_source(source, allow_prepared=True)
+        self._source_scope = (source, key)
+        try:
+            cached = self._location_cache
+            locked = candidate_widths is not None and len(candidate_widths) == 1
+            if cached is not None and locked:
+                old_box, old_score, frame_key = cached
+                if (candidate_widths[0] == old_box[2]
+                        and self._stable_frame_key(screenshot, old_box) == frame_key):
+                    self.performance_counters["local_searches"] += 1
+                    found, score, box = self._locate_nearby(screenshot, source, old_box)
+                    if found and score >= max(self.similarity_threshold, old_score - .12):
+                        self.performance_counters["cache_hits"] += 1
+                        self._location_cache = (box, score, self._stable_frame_key(screenshot, box))
+                        return found, score, box
+            self.performance_counters["cache_misses"] += 1
+            self.performance_counters["full_searches"] += 1
+            found, score, box = self._locate_current_full(screenshot, source, candidate_widths)
+            self._location_cache = (box, score, self._stable_frame_key(screenshot, box)) if found and box else None
+            return found, score, box
+        finally:
+            # A frame-level scope saves repeated hashing in the lower-message
+            # search, without retaining another potentially huge source image.
+            self._source_scope = None
+
+    def _locate_current_full(self, screenshot, source, candidate_widths=None):
         """Use the reference matcher, preferring a lower matching message.
 
         No history identity, message count or scroll reconstruction is required.
@@ -447,7 +595,10 @@ class VisualBubbleVerifier:
         widths = candidate_widths
         if widths is None and screenshot.width * .75 > 340:
             maximum = min(1000, int(screenshot.width * .75))
-            widths = sorted(set([340, 310, 280, 260, 240, 225, 210, 195, 180, 168,
+            # 125% and 200% render the common 160 px thumbnail at 200/320
+            # physical pixels. Exact fits keep central-overlay registration
+            # valid without relaxing source comparison or spinner thresholds.
+            widths = sorted(set([340, 320, 310, 280, 260, 240, 225, 210, 200, 195, 180, 168,
                                  160, 150, 140, 130, 120, 110, 100, 90, 80, 70, 60]
                                 + list(range(360, maximum + 1, 30)) + [maximum]), reverse=True)
         found, score, box = self.locate_thumbnail(screenshot, source, widths)

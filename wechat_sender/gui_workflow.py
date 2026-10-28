@@ -34,6 +34,11 @@ class SenderWorkflowMixin:
             "_scan_source_mode": None,
             "_scan_source_paths": (),
             "_scan_source_base": None,
+            "_progress_counts_job": None,
+            "_progress_stages": (),
+            "_progress_done": 0,
+            "_progress_verify": 0,
+            "_dashboard_controls_key": None,
         }
         for key, value in defaults.items():
             if not hasattr(self, key):
@@ -84,6 +89,7 @@ class SenderWorkflowMixin:
             "_pre_send_shot", "_pre_send_wal", "_last_locked_bbox", "_last_sent_image",
             "_capture_signature", "_capture_backend", "_image_verify_hwnd",
             "_last_confirmed_path", "_last_confirmed_frame",
+            "_last_confirmed_source",
         ):
             if hasattr(self.adapter, name):
                 setattr(self.adapter, name, None)
@@ -92,6 +98,9 @@ class SenderWorkflowMixin:
         self._verify_orig_photo = None
         self._verify_live_photo = None
         self._last_progress_preview_index = None
+        self._progress_counts_job = None
+        self._progress_stages = ()
+        self._dashboard_controls_key = None
 
     def _clear_scan_source(self) -> None:
         self._scan_source_mode = None
@@ -291,12 +300,41 @@ class SenderWorkflowMixin:
         # Sorting changes the underlying draft, never just the visible rows.
         return sorted(rows, key=lambda row: row[0])
 
+    def _prime_progress_counts(self, job) -> None:
+        # Queue edits are locked during a run. Seed once before its worker
+        # starts, then apply the immutable stage snapshots received by the UI.
+        self._progress_counts_job = job
+        self._progress_stages = [item.stage for item in job.items]
+        self._progress_done = self._progress_stages.count(ItemStage.COMPLETED.value)
+        self._progress_verify = self._progress_stages.count(ItemStage.NEEDS_MANUAL_VERIFY.value)
+
+    def _record_progress_stage(self, job, index: int, stage: str) -> None:
+        if not self._run_active or job is None:
+            return
+        if self._progress_counts_job is not job or len(self._progress_stages) != len(job.items):
+            self._prime_progress_counts(job)
+        if not 0 <= index < len(self._progress_stages):
+            self._progress_counts_job = None
+            return
+        previous = self._progress_stages[index]
+        if previous != stage:
+            self._progress_done += int(stage == ItemStage.COMPLETED.value) - int(previous == ItemStage.COMPLETED.value)
+            self._progress_verify += int(stage == ItemStage.NEEDS_MANUAL_VERIFY.value) - int(previous == ItemStage.NEEDS_MANUAL_VERIFY.value)
+            self._progress_stages[index] = stage
+
     def _update_kpi_dashboard(self) -> None:
         self._workflow_state()
         records = self.current_job.items if self.current_job else []
         total = len(records) if self.current_job else len(self.scanned_items)
-        done = sum(item.stage == ItemStage.COMPLETED.value for item in records)
-        verify = sum(item.stage == ItemStage.NEEDS_MANUAL_VERIFY.value for item in records)
+        if self._run_active and self.current_job is not None:
+            if self._progress_counts_job is not self.current_job or len(self._progress_stages) != total:
+                self._prime_progress_counts(self.current_job)
+            done, verify = self._progress_done, self._progress_verify
+        else:
+            # Paused/manual actions can change records outside engine callbacks.
+            # Recount then; the running hot path never scans the whole queue.
+            done = sum(item.stage == ItemStage.COMPLETED.value for item in records)
+            verify = sum(item.stage == ItemStage.NEEDS_MANUAL_VERIFY.value for item in records)
         pct = done * 100.0 / total if total else 0.0
         self.progress_var.set(pct)
         self.kpi_val_labels["total"].configure(text=f"{total} 张")
@@ -309,7 +347,11 @@ class SenderWorkflowMixin:
             elapsed = max(0.01, end - self._run_start_ts)
             speed += f" · {elapsed / current_done:.2f} 秒/张"
         self.kpi_val_labels["speed"].configure(text=speed)
-        self._sync_task_controls()
+        controls_key = (id(self.current_job), self._sender_running(), self._scan_busy,
+                        self._connection_busy, total, bool(total and done == total), bool(verify))
+        if controls_key != self._dashboard_controls_key:
+            self._dashboard_controls_key = controls_key
+            self._sync_task_controls()
 
     def start_or_resume(self) -> None:
         self._workflow_state()
@@ -356,8 +398,14 @@ class SenderWorkflowMixin:
         self._run_completed_baseline = sum(item.stage == ItemStage.COMPLETED.value for item in job.items)
         self._run_start_ts, self._run_end_ts = time.monotonic(), None
         self._last_progress_preview_index = None
+        self._prime_progress_counts(job)
+        self._dashboard_controls_key = None
         self._run_active = True
         self.engine.stop_requested = False
+        if hasattr(self.engine, "last_performance_log"):
+            # COM initialization can fail before run_job gets a chance to
+            # clear its own record; never present a previous run's timings.
+            self.engine.last_performance_log = None
         self._sync_task_controls()
         self.status_var.set(f"正在发送至：{job.target_chat}")
         self._append_log(f"开始发送 → {job.target_chat}（按照列表序号逐张核实）")
@@ -370,10 +418,15 @@ class SenderWorkflowMixin:
             self._run_active = False
             self.worker_thread = None
             self._run_end_ts = ended
+            self._progress_counts_job = None
+            self._progress_stages = ()
             self._hide_mini_hud()
             self._update_kpi_dashboard()
             self.status_var.set(summary)
             self._append_log(summary)
+            timing_log = getattr(self.engine, "last_performance_log", None)
+            if timing_log is not None:
+                self._append_log(f"耗时记录：{timing_log}")
             if getattr(self, "_shutdown_pending", False):
                 return
             if not ok:
@@ -407,6 +460,7 @@ class SenderWorkflowMixin:
             if self._closing or self.current_job is not job:
                 return
             from .gui import STAGE_BADGES
+            self._record_progress_stage(job, index, stage)
             iid = str(index)
             badge = STAGE_BADGES.get(stage, stage)
             matches = self._row_matches_filter(relative, name, stage)
@@ -419,8 +473,9 @@ class SenderWorkflowMixin:
                 else:
                     position = sum(int(child) < index for child in self.tree.get_children())
                     self.tree.insert("", position, iid=iid, values=values, tags=(self._stage_to_tag(stage),))
-                self.tree.see(iid)
-                self.tree.selection_set(iid)
+                if self.tree.selection() != (iid,):
+                    self.tree.see(iid)
+                    self.tree.selection_set(iid)
             if self._last_progress_preview_index != index:
                 self._show_preview_for_index(index)
                 self._last_progress_preview_index = index
