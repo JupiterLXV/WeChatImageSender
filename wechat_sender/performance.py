@@ -64,6 +64,7 @@ class ItemPerformanceTrace:
         # Only known numerical counters can cross the diagnostic boundary.
         allowed = {"cache_hits", "cache_misses", "full_searches", "local_searches",
                    "template_resizes", "template_cache_hits", "source_cache_hits", "source_cache_misses",
+                   "source_array_builds", "overlay_resizes", "overlay_cache_hits",
                    "roi_hits", "roi_misses", "match_calls",
                    "analysis_pixels", "capture_frames", "prepare_retries"}
         for key, value in values.items():

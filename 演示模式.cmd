@@ -9,8 +9,8 @@ if exist "main.py" (
     )
 ) else if exist "WeChatImageSender.exe" (
     start "" "WeChatImageSender.exe" --demo
-) else if exist "releases\3.6.5\WeChatImageSender\WeChatImageSender.exe" (
-    start "" "releases\3.6.5\WeChatImageSender\WeChatImageSender.exe" --demo
+) else if exist "releases\3.6.6\WeChatImageSender\WeChatImageSender.exe" (
+    start "" "releases\3.6.6\WeChatImageSender\WeChatImageSender.exe" --demo
 ) else (
     echo 未找到程序入口，请确认已完整解压项目或程序包。
     pause

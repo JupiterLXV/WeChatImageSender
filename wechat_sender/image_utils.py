@@ -312,14 +312,17 @@ class VisualBubbleVerifier:
         self.performance_counters = {name: 0 for name in (
             "cache_hits", "cache_misses", "full_searches", "local_searches",
             "template_resizes", "template_cache_hits", "source_cache_hits",
-            "source_cache_misses",
+            "source_cache_misses", "source_array_builds", "overlay_resizes", "overlay_cache_hits",
         )}
         self._source_key = None
         self._source_arrays = None
         self._source_scope = None
+        self._source_scope_arrays = None
         self._prepared_source_ref = None
         self._templates = OrderedDict()
         self._template_bytes = 0
+        self._overlay_templates = OrderedDict()
+        self._overlay_bytes = 0
         self._location_cache = None
 
     def begin_image(self, source):
@@ -348,8 +351,11 @@ class VisualBubbleVerifier:
         if key != self._source_key:
             self._source_key = key
             self._source_arrays = None
+            self._source_scope_arrays = None
             self._templates.clear()
             self._template_bytes = 0
+            self._overlay_templates.clear()
+            self._overlay_bytes = 0
             self._location_cache = None
             self.performance_counters["source_cache_misses"] += 1
         else:
@@ -359,6 +365,9 @@ class VisualBubbleVerifier:
     def _prepared_arrays(self, source):
         if self._source_arrays is not None:
             return self._source_arrays
+        if self._source_scope_arrays is not None:
+            return self._source_scope_arrays
+        self.performance_counters["source_array_builds"] += 1
         rgb = source.convert("RGB")
         sw, sh = rgb.size
         mx, my = int(round(sw * .10)), int(round(sh * .10))
@@ -369,7 +378,19 @@ class VisualBubbleVerifier:
         # retained. Large source arrays live only for the current evaluation.
         if arrays[0].nbytes + arrays[1].nbytes <= 16 * 1024 * 1024:
             self._source_arrays = arrays
+        elif self._source_scope is not None:
+            # Lower-message searches share this evaluation's large arrays.
+            # They are released by the outer location scope, never retained
+            # between frames or as a second copy of a large decoded source.
+            self._source_scope_arrays = arrays
         return arrays
+
+    def _source_template(self, source, width, height, inner):
+        key = (bool(inner), int(width), int(height))
+        if key in self._templates:
+            return self._template(None, width, height, inner)
+        full_array, inner_array, _ = self._prepared_arrays(source)
+        return self._template(inner_array if inner else full_array, width, height, inner)
 
     def _template(self, array, width, height, inner):
         key = (bool(inner), int(width), int(height))
@@ -416,13 +437,7 @@ class VisualBubbleVerifier:
         ih = max(16, int(round(height * .80))) if use_inner else height
         if iw >= roi.shape[1] or ih >= roi.shape[0]:
             return False, 0.0, None
-        # Large sources need no RGB conversion or array allocation once their
-        # two small locked-size templates already exist.
-        if (True, iw, ih) in self._templates and (False, width, height) in self._templates:
-            full = inner = None
-        else:
-            full, inner, _ = self._prepared_arrays(source)
-        template = self._template(inner, iw, ih, True)
+        template = self._source_template(source, iw, ih, True)
         response = cv2.matchTemplate(roi, template, cv2.TM_SQDIFF_NORMED)
         _, _, position, _ = cv2.minMaxLoc(response)
         ix, iy = position
@@ -431,7 +446,7 @@ class VisualBubbleVerifier:
         by = top + iy - (height - ih) // 2
         if bx < 0 or by < 0 or bx + width > screenshot.width or by + height > screenshot.height:
             return False, score, None
-        full_template = self._template(full, width, height, False)
+        full_template = self._source_template(source, width, height, False)
         score = max(score, self._perceptual_patch_similarity(chat[by:by+height, bx:bx+width], full_template))
         return score >= self.similarity_threshold, score, (bx, by, width, height)
 
@@ -486,8 +501,18 @@ class VisualBubbleVerifier:
         source_image: Image.Image,
         candidate_widths: Optional[List[int]] = None,
     ) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
-        if self._source_scope is None or self._source_scope[0] is not source_image:
-            self._prepare_source(source_image)
+        own_scope = self._source_scope is None or self._source_scope[0] is not source_image
+        if own_scope:
+            key = self._prepare_source(source_image)
+            self._source_scope = (source_image, key)
+        try:
+            return self._locate_thumbnail_prepared(chat_screenshot, source_image, candidate_widths)
+        finally:
+            if own_scope:
+                self._source_scope = None
+                self._source_scope_arrays = None
+
+    def _locate_thumbnail_prepared(self, chat_screenshot, source_image, candidate_widths):
         chat_rgb_img = chat_screenshot.convert("RGB")
         cw, ch = chat_rgb_img.size
         sw, sh = source_image.size
@@ -509,7 +534,8 @@ class VisualBubbleVerifier:
         roi_rgb = chat_arr[:, search_x_start:]
         rw = roi_rgb.shape[1]
 
-        src_full_arr, src_inner_arr, use_inner = self._prepared_arrays(source_image)
+        margin_x, margin_y = int(round(sw * .10)), int(round(sh * .10))
+        use_inner = sw - 2 * margin_x >= 16 and sh - 2 * margin_y >= 16
 
         best_score = -1.0
         best_bbox = None
@@ -531,7 +557,7 @@ class VisualBubbleVerifier:
             if iw >= rw or ih >= ch:
                 continue
 
-            tpl_inner_rgb = self._template(src_inner_arr, iw, ih, True)
+            tpl_inner_rgb = self._source_template(source_image, iw, ih, True)
             res = cv2.matchTemplate(roi_rgb, tpl_inner_rgb, cv2.TM_SQDIFF_NORMED)
             _, _, min_loc, _ = cv2.minMaxLoc(res)
             ix, iy = int(min_loc[0]), int(min_loc[1])
@@ -548,7 +574,7 @@ class VisualBubbleVerifier:
             full_h = min(th, ch - full_y)
 
             if full_w >= 24 and full_h >= 24:
-                tpl_full_rgb = self._template(src_full_arr, full_w, full_h, False)
+                tpl_full_rgb = self._source_template(source_image, full_w, full_h, False)
                 patch_full = chat_arr[full_y : full_y + full_h, full_x : full_x + full_w]
                 full_score = self._perceptual_patch_similarity(patch_full, tpl_full_rgb)
                 score = max(score, full_score)
@@ -585,6 +611,7 @@ class VisualBubbleVerifier:
             # A frame-level scope saves repeated hashing in the lower-message
             # search, without retaining another potentially huge source image.
             self._source_scope = None
+            self._source_scope_arrays = None
 
     def _locate_current_full(self, screenshot, source, candidate_widths=None):
         """Use the reference matcher, preferring a lower matching message.
@@ -753,6 +780,7 @@ class VisualBubbleVerifier:
         if (width < 36 or height < 36 or x < 0 or y < 0
                 or x + width > screenshot.width or y + height > screenshot.height):
             return False
+        self._prepare_source(source_image, allow_prepared=True)
         actual = np.asarray(screenshot.convert("RGB").crop((x, y, x + width, y + height)), dtype=np.float32)
         center_x, center_y = width // 2, height // 2
         half = min(64, int(min(width, height) * .32))
@@ -765,9 +793,29 @@ class VisualBubbleVerifier:
         if sample_x.size < 100:
             return False
         best = None
-        source = source_image.convert("RGB")
+        source = None
         for method in (Image.Resampling.LANCZOS, Image.Resampling.BILINEAR):
-            expected = np.asarray(source.resize((width, height), method), dtype=np.float32)
+            key = (width, height, int(method))
+            cached = self._overlay_templates.get(key)
+            if cached is None:
+                if source is None:
+                    source = source_image.convert("RGB")
+                cached = np.asarray(source.resize((width, height), method), dtype=np.uint8)
+                self.performance_counters["overlay_resizes"] += 1
+                limit = 16 * 1024 * 1024
+                while self._overlay_templates and (self._overlay_bytes + cached.nbytes > limit
+                                                   or len(self._overlay_templates) >= 16):
+                    _, retired = self._overlay_templates.popitem(last=False)
+                    self._overlay_bytes -= retired.nbytes
+                if cached.nbytes <= limit:
+                    self._overlay_templates[key] = cached
+                    self._overlay_bytes += cached.nbytes
+            else:
+                self._overlay_templates.move_to_end(key)
+                self.performance_counters["overlay_cache_hits"] += 1
+            # Cache source-only pixels, never registration, residuals, spinner
+            # flags or completion. Those still use this frame's actual photo.
+            expected = cached.astype(np.float32)
             for dy in (-1, 0, 1):
                 for dx in (-1, 0, 1):
                     delta = actual[sample_y, sample_x] - expected[sample_y + dy, sample_x + dx]

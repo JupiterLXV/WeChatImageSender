@@ -124,14 +124,16 @@ class TestUploadCompletionBarrier(unittest.TestCase):
         adapter.wal_tracker.snapshot.side_effect = range(1000)
         result, clock = self.verify(adapter)
         self.assertTrue(result.is_upload_complete)
-        self.assertGreaterEqual(clock.now, 0.75 + 1.5)
+        self.assertGreaterEqual(clock.now, 1.5)
+        self.assertLess(clock.now, 1.5 + 0.2)
         adapter.wal_tracker.snapshot.assert_not_called()
 
     def test_larger_requested_quiet_interval_is_honored(self):
         adapter = mocked_windows_adapter(self.blank, self.chat)
         result, clock = self.verify(adapter, stable=2.5)
         self.assertTrue(result.is_upload_complete)
-        self.assertGreaterEqual(clock.now, 0.75 + 2.5)
+        self.assertGreaterEqual(clock.now, 2.5)
+        self.assertLess(clock.now, 2.5 + 0.2)
 
     def test_submitted_matching_image_is_not_blocked_by_identical_history(self):
         adapter = mocked_windows_adapter(self.chat.copy(), self.chat)

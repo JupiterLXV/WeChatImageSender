@@ -1081,7 +1081,10 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
         # effect. Never replay the whole operation with another keyboard backend.
         with _uia_thread_scope():
             self._assert_submission_foreground()
-            auto.SendKeys("{Ctrl}v", waitTime=paste_wait)
+            # SendKeys already delays after the chord via its interval. Keep
+            # the single cancellable settling wait below, rather than also
+            # asking the library for the same uninterruptible wait.
+            auto.SendKeys("{Ctrl}v", waitTime=0)
             if self._wait_or_stop(paste_wait):
                 raise RuntimeError("已暂停；内容可能仍在微信输入框，请先核实")
             self._assert_submission_foreground()
@@ -1171,6 +1174,7 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
             try:
                 with self._measure("capture"):
                     shot = self._capture_chat_region()
+                observed_at = time.monotonic()
             except Exception as exc:
                 return self._unconfirmed_status(f"无法可靠读取聊天画面：{exc}")
             self.last_verify_screenshot = shot
@@ -1191,14 +1195,18 @@ class WindowsWeChatAdapter(BaseWeChatAdapter):
             # Follow the reference pipeline: current image matching and upload
             # state decide readiness. History counts/scroll proofs are not a gate.
             ready = self.image_status_allows_name(status)
-            if ready and now - started >= max(0.75, self.post_send_grace_sec):
+            if ready:
                 if quiet_since is None or not self._same_image_bbox(stable_bbox, status.bbox):
-                    quiet_since, quiet_frames = now, 1
+                    quiet_since, quiet_frames = observed_at, 1
                     stable_bbox = status.bbox
                 else:
                     quiet_frames += 1
-                if quiet_frames >= 4 and now - quiet_since >= quiet_required:
-                    status.reason = f"图片匹配，转圈消失且连续稳定 {now - quiet_since:.1f} 秒"
+                # Observe the grace period and quiet interval concurrently.
+                # Use capture timestamps, so time spent processing the final
+                # screenshot cannot substitute for fresh quiet observations.
+                if (quiet_frames >= 4 and observed_at - quiet_since >= quiet_required
+                        and now - started >= max(0.75, self.post_send_grace_sec)):
+                    status.reason = f"图片匹配，转圈消失且连续稳定 {observed_at - quiet_since:.1f} 秒"
                     self._last_confirmed_path = os.path.normcase(str(image_path.resolve()))
                     self._last_confirmed_frame = shot
                     self._last_confirmed_source = src_img
